@@ -1,0 +1,3749 @@
+These are the code used in expense tracker website
+
+1.app.py
+from flask import Flask, render_template, request, redirect, url_for, flash, session, jsonify
+from flask_bcrypt import Bcrypt
+from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
+import sqlite3
+from datetime import datetime, timedelta
+import secrets
+import smtplib
+from email.mime.text import MIMEText
+from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.utils import secure_filename
+import openai
+from PIL import Image, ImageEnhance, ImageFilter  # Add ImageFilter
+import pytesseract
+import numpy as np
+import io
+import re
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import StandardScaler
+import pandas as pd
+import os
+import speech_recognition as sr
+from gtts import gTTS
+import pygame
+import tempfile
+import json
+import logging
+from logging.handlers import RotatingFileHandler
+from apscheduler.schedulers.background import BackgroundScheduler
+
+# Initialize Flask app
+app = Flask(__name__)
+handler = RotatingFileHandler('app.log', maxBytes=10000, backupCount=3)
+handler.setLevel(logging.ERROR)
+app.logger.addHandler(handler)
+
+
+app.secret_key = ''  # Change this in production
+bcrypt = Bcrypt(app)
+
+# Flask-Login setup
+login_manager = LoginManager(app)
+login_manager.login_view = 'login'
+
+# Configuration
+app.config['DATABASE'] = 'expenses.db'
+app.config['UPLOAD_FOLDER'] = 'uploads'
+app.config['ALLOWED_EXTENSIONS'] = {'png', 'jpg', 'jpeg'}
+app.config['MAIL_SERVER'] = 'smtp.example.com'
+app.config['MAIL_PORT'] = 587
+app.config['MAIL_USE_TLS'] = True
+app.config['MAIL_USERNAME'] = 'your-email@example.com'
+app.config['MAIL_PASSWORD'] = 'your-email-password'
+app.config['OPENAI_API_KEY'] = 'your-openai-api-key'
+
+# Initialize third-party services
+openai.api_key = app.config['OPENAI_API_KEY']
+pygame.mixer.init()
+r = sr.Recognizer()
+scheduler = BackgroundScheduler()
+scheduler.start()
+
+# Create upload folder if it doesn't exist
+if not os.path.exists(app.config['UPLOAD_FOLDER']):
+    os.makedirs(app.config['UPLOAD_FOLDER'])
+
+
+# Database initialization
+def init_db():
+    conn = sqlite3.connect(app.config['DATABASE'])
+    cursor = conn.cursor()
+
+    try:
+        # Check if monthly_income column exists
+        cursor.execute("PRAGMA table_info(users)")
+        columns = [column[1] for column in cursor.fetchall()]
+
+        if 'monthly_income' not in columns:
+            cursor.execute("ALTER TABLE users ADD COLUMN monthly_income REAL DEFAULT 0")
+
+        # Create tables
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL UNIQUE,
+            email TEXT NOT NULL UNIQUE,
+            password TEXT NOT NULL,
+            monthly_income REAL DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        ''')
+
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS categories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            name TEXT NOT NULL,
+            is_default BOOLEAN DEFAULT 0,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+        ''')
+
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS expenses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            amount REAL NOT NULL,
+            category_id INTEGER NOT NULL,
+            date TEXT NOT NULL,
+            notes TEXT,
+            FOREIGN KEY (user_id) REFERENCES users(id),
+            FOREIGN KEY (category_id) REFERENCES categories(id)
+        )
+        ''')
+
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS reset_tokens (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            token TEXT NOT NULL UNIQUE,
+            expires_at TIMESTAMP NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+        ''')
+
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS reminders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            description TEXT NOT NULL,
+            due_date TEXT NOT NULL,
+            recurring TEXT NOT NULL,
+            completed BOOLEAN DEFAULT 0,
+            notified BOOLEAN DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+        ''')
+
+        # Insert default categories
+        default_categories = [
+            ('Food', 1), ('Travel', 1), ('Rent', 1), ('Utilities', 1),
+            ('Entertainment', 1), ('Healthcare', 1), ('Shopping', 1), ('Other', 1)
+        ]
+
+        # FIXED: Change to select only the name column (row[0])
+        cursor.execute("SELECT name FROM categories WHERE is_default = 1")
+        existing_defaults = [row[0] for row in cursor.fetchall()]  # Changed from row[1] to row[0]
+
+        for name, is_default in default_categories:
+            if name not in existing_defaults:
+                cursor.execute(
+                    "INSERT INTO categories (name, is_default) VALUES (?, ?)",
+                    (name, is_default)
+                )
+
+        conn.commit()
+    except sqlite3.Error as e:
+        print(f"Database error: {e}")
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+# User class for Flask-Login
+class User(UserMixin):
+    def __init__(self, id, username, email):
+        self.id = id
+        self.username = username
+        self.email = email
+        self._reminders = None
+
+    @property
+    def reminders(self):
+        if self._reminders is None:
+            conn = sqlite3.connect(app.config['DATABASE'])
+            cursor = conn.cursor()
+            cursor.execute('''
+            SELECT id, description, due_date, recurring, completed 
+            FROM reminders 
+            WHERE user_id = ? AND completed = 0
+            ORDER BY due_date
+            ''', (self.id,))
+            self._reminders = [{
+                'id': row[0],
+                'description': row[1],
+                'due_date': row[2],
+                'recurring': row[3],
+                'completed': row[4]
+            } for row in cursor.fetchall()]
+            conn.close()
+        return self._reminders
+
+    def add_reminder(self, description, due_date, recurring):
+        conn = sqlite3.connect(app.config['DATABASE'])
+        cursor = conn.cursor()
+        cursor.execute('''
+        INSERT INTO reminders (user_id, description, due_date, recurring)
+        VALUES (?, ?, ?, ?)
+        ''', (self.id, description, due_date, recurring))
+        reminder_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+
+        due_datetime = datetime.strptime(due_date, '%Y-%m-%d')
+        scheduler.add_job(
+            notify_reminder,
+            'date',
+            run_date=due_datetime,
+            args=[self.id, reminder_id],
+            id=f"reminder_{self.id}_{reminder_id}"
+        )
+
+        self._reminders = None
+        return reminder_id
+
+
+@login_manager.user_loader
+def load_user(user_id):
+    conn = sqlite3.connect(app.config['DATABASE'])
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, username, email FROM users WHERE id = ?", (user_id,))
+    user_data = cursor.fetchone()
+    conn.close()
+    if user_data:
+        return User(id=user_data[0], username=user_data[1], email=user_data[2])
+    return None
+
+
+def notify_reminder(user_id, reminder_id):
+    with app.app_context():
+        conn = sqlite3.connect(app.config['DATABASE'])
+        cursor = conn.cursor()
+
+        # Mark as notified
+        cursor.execute('''
+        UPDATE reminders SET notified = 1 WHERE id = ? AND user_id = ?
+        ''', (reminder_id, user_id))
+
+        # Get reminder details
+        cursor.execute('''
+        SELECT description, due_date, recurring 
+        FROM reminders 
+        WHERE id = ? AND user_id = ?
+        ''', (reminder_id, user_id))
+        reminder = cursor.fetchone()
+
+        if reminder:
+            description, due_date, recurring = reminder
+
+            # Handle recurring reminders
+            if recurring != 'none':
+                new_due_date = None
+                if recurring == 'daily':
+                    new_due_date = (datetime.strptime(due_date, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
+                elif recurring == 'weekly':
+                    new_due_date = (datetime.strptime(due_date, '%Y-%m-%d') + timedelta(weeks=1)).strftime('%Y-%m-%d')
+                elif recurring == 'monthly':
+                    new_due_date = (datetime.strptime(due_date, '%Y-%m-%d') + timedelta(days=30)).strftime('%Y-%m-%d')
+                elif recurring == 'yearly':
+                    new_due_date = (datetime.strptime(due_date, '%Y-%m-%d') + timedelta(days=365)).strftime('%Y-%m-%d')
+
+                if new_due_date:
+                    cursor.execute('''
+                    INSERT INTO reminders (user_id, description, due_date, recurring)
+                    VALUES (?, ?, ?, ?)
+                    ''', (user_id, description, new_due_date, recurring))
+                    new_reminder_id = cursor.lastrowid
+
+                    # Schedule next notification
+                    new_due_datetime = datetime.strptime(new_due_date, '%Y-%m-%d')
+                    scheduler.add_job(
+                        notify_reminder,
+                        'date',
+                        run_date=new_due_datetime,
+                        args=[user_id, new_reminder_id],
+                        id=f"reminder_{user_id}_{new_reminder_id}"
+                    )
+
+        conn.commit()
+        conn.close()
+
+
+# AI Functions
+def ai_categorize_expense(expense_title):
+    try:
+        prompt = f"""Categorize this expense into one of these categories: 
+        Food, Travel, Rent, Utilities, Entertainment, Healthcare, Shopping, Other.
+        Expense: {expense_title}
+        Return only the category name."""
+
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=20
+        )
+
+        category = response.choices[0].message.content.strip()
+        return category
+    except Exception as e:
+        print(f"AI Categorization Error: {e}")
+        return "Other"
+
+
+def predict_future_expenses(user_id):
+    conn = sqlite3.connect(app.config['DATABASE'])
+    df = pd.read_sql_query(f"""
+    SELECT date, amount 
+    FROM expenses 
+    WHERE user_id = {user_id} 
+    ORDER BY date
+    """, conn)
+    conn.close()
+
+    if len(df) < 10:
+        return "Not enough historical data to make predictions"
+
+    df['date'] = pd.to_datetime(df['date'])
+    df.set_index('date', inplace=True)
+    daily_expenses = df.resample('D').sum().fillna(0)
+
+    avg_last_week = daily_expenses.last('7D').mean()[0]
+    avg_last_month = daily_expenses.last('30D').mean()[0]
+    prediction = (avg_last_week + avg_last_month) / 2
+
+    return {
+        'predicted_daily': round(prediction, 2),
+        'predicted_weekly': round(prediction * 7, 2),
+        'predicted_monthly': round(prediction * 30, 2)
+    }
+
+
+def detect_spending_anomalies(user_id):
+    conn = sqlite3.connect(app.config['DATABASE'])
+    df = pd.read_sql_query(f"""
+    SELECT date, amount 
+    FROM expenses 
+    WHERE user_id = {user_id} 
+    ORDER BY date
+    """, conn)
+    conn.close()
+
+    if len(df) < 10:
+        return []
+
+    df['date'] = pd.to_datetime(df['date'])
+    df['day_of_week'] = df['date'].dt.dayofweek
+    df['day_of_month'] = df['date'].dt.day
+    df['month'] = df['date'].dt.month
+
+    features = df[['amount', 'day_of_week', 'day_of_month', 'month']]
+    scaler = StandardScaler()
+    scaled_features = scaler.fit_transform(features)
+
+    clf = IsolationForest(contamination=0.1)
+    clf.fit(scaled_features)
+
+    df['anomaly'] = clf.predict(scaled_features)
+    anomalies = df[df['anomaly'] == -1].sort_values('amount', ascending=False)
+
+    results = []
+    for _, row in anomalies.iterrows():
+        results.append({
+            'date': row['date'].strftime('%Y-%m-%d'),
+            'amount': row['amount'],
+            'reason': "Unusually high spending for this time period"
+        })
+
+    return results[:5]
+
+
+def generate_financial_tips(user_id):
+    conn = sqlite3.connect(app.config['DATABASE'])
+    df = pd.read_sql_query(f"""
+    SELECT c.name as category, SUM(e.amount) as total 
+    FROM expenses e 
+    JOIN categories c ON e.category_id = c.id 
+    WHERE e.user_id = {user_id} 
+    GROUP BY c.name
+    ORDER BY total DESC
+    """, conn)
+
+    cursor = conn.cursor()
+    cursor.execute("SELECT monthly_income FROM users WHERE id = ?", (user_id,))
+    monthly_income = cursor.fetchone()[0] or 3000
+    conn.close()
+
+    if len(df) == 0:
+        return ["Start tracking your expenses to get personalized tips!"]
+
+    prompt = "Based on these spending categories and amounts, provide 3 concise financial tips:\n"
+    for _, row in df.iterrows():
+        prompt += f"{row['category']}: ${row['total']}\n"
+
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=200
+        )
+        tips = response.choices[0].message.content.strip().split('\n')
+        return [tip for tip in tips if tip.strip()][:3]
+    except Exception as e:
+        print(f"AI Tips Error: {e}")
+        return [
+            "Review your largest spending categories for potential savings",
+            "Consider setting monthly budgets for your top categories",
+            "Track your expenses regularly to identify spending patterns"
+        ]
+
+
+def chat_with_ai(user_id, message):
+    try:
+        if not message or not isinstance(message, str):
+            return {'response': "Please provide a valid message.", 'redirect': None}
+
+        lower_msg = message.lower()
+
+        # Handle "total spending" queries first
+        if ('total spending' in lower_msg or
+            'how much did i spend' in lower_msg) and 'on ' not in lower_msg:
+
+            time_period = 'this month'  # Default
+            if 'last month' in lower_msg:
+                time_period = 'last month'
+            elif 'this week' in lower_msg:
+                time_period = 'this week'
+
+            try:
+                conn = sqlite3.connect(app.config['DATABASE'])
+                cursor = conn.cursor()
+
+                if time_period == 'this month':
+                    cursor.execute('''
+                    SELECT COALESCE(SUM(amount), 0) 
+                    FROM expenses 
+                    WHERE user_id = ? 
+                    AND strftime('%Y-%m', date) = strftime('%Y-%m', 'now')
+                    ''', (user_id,))
+                elif time_period == 'last month':
+                    cursor.execute('''
+                    SELECT COALESCE(SUM(amount), 0) 
+                    FROM expenses 
+                    WHERE user_id = ? 
+                    AND strftime('%Y-%m', date) = strftime('%Y-%m', 'now', '-1 month')
+                    ''', (user_id,))
+                else:  # this week
+                    cursor.execute('''
+                    SELECT COALESCE(SUM(amount), 0) 
+                    FROM expenses 
+                    WHERE user_id = ? 
+                    AND date >= date('now', 'weekday 0', '-7 days')
+                    ''', (user_id,))
+
+                total = cursor.fetchone()[0]
+                conn.close()
+
+                return {
+                    'response': f"Your total spending {time_period} is ${total:.2f}",
+                    'redirect': None
+                }
+            except sqlite3.Error as e:
+                print(f"Database error: {e}")
+                return {'response': "I couldn't access your spending data right now.", 'redirect': None}
+
+        # Navigation commands
+        if any(cmd in lower_msg for cmd in ['go to', 'take me to', 'show me the', 'open the']):
+            redirects = {
+                'dashboard': url_for('dashboard'),
+                'expense': url_for('expenses'),
+                'add expense': url_for('add_expense'),
+                'categor': url_for('manage_categories'),  # matches 'categories' or 'category'
+                'report': url_for('reports'),  # matches 'reports' or 'report'
+                'analytics': url_for('analytics'),
+                'settings': url_for('settings'),
+                'predictions': url_for('show_predictions'),
+                'anomalies': url_for('show_anomalies'),
+                'tips': url_for('show_tips'),
+                'receipt': url_for('receipt_scan'),
+                'scan': url_for('receipt_scan'),
+                'reminders': url_for('view_reminders')
+            }
+
+            for keyword, url in redirects.items():
+                if keyword in lower_msg:
+                    if keyword == 'tips' and 'chat' in lower_msg:
+                        continue  # avoid conflict with 'chat' in 'financial tips'
+                    return {
+                        'response': f"Taking you to {keyword.replace('expense', 'expenses').title()}.",
+                        'redirect': url
+                    }
+
+            if 'chat' in lower_msg:
+                return {'response': 'You are already in the chat.', 'redirect': None}
+
+        # Action commands
+        if 'delete last expense' in lower_msg:
+            try:
+                conn = sqlite3.connect(app.config['DATABASE'])
+                cursor = conn.cursor()
+                cursor.execute('''
+                SELECT id FROM expenses 
+                WHERE user_id = ? 
+                ORDER BY date DESC, id DESC 
+                LIMIT 1
+                ''', (user_id,))
+                last_expense = cursor.fetchone()
+                conn.close()
+
+                if last_expense:
+                    return {
+                        'response': f"Do you want to delete your most recent expense (ID: {last_expense[0]})?",
+                        'action': 'confirm_delete',
+                        'expense_id': last_expense[0]
+                    }
+                return {'response': "You don't have any expenses to delete."}
+            except sqlite3.Error as e:
+                print(f"Database error: {e}")
+                return {'response': "I couldn't access your expenses right now."}
+
+        # Specific queries
+        if 'how much did i spend on' in lower_msg:
+            match = re.search(r'on (.*?)(\?|$)', lower_msg)
+            if not match:
+                return {'response': "Please specify what category you want to check spending for."}
+
+            category = match.group(1).strip()
+            if not category:
+                return {'response': "Please specify what category you want to check spending for."}
+
+            try:
+                conn = sqlite3.connect(app.config['DATABASE'])
+                cursor = conn.cursor()
+                cursor.execute('''
+                SELECT COALESCE(SUM(e.amount), 0)
+                FROM expenses e 
+                JOIN categories c ON e.category_id = c.id 
+                WHERE e.user_id = ? AND c.name LIKE ?
+                ''', (user_id, f'%{category}%'))
+                total = cursor.fetchone()[0]
+                conn.close()
+                return {'response': f"You've spent ${total:.2f} on {category}."}
+            except sqlite3.Error as e:
+                print(f"Database error: {e}")
+                return {'response': "I couldn't check your spending right now."}
+
+        elif 'what did i spend the most on' in lower_msg:
+            try:
+                conn = sqlite3.connect(app.config['DATABASE'])
+                cursor = conn.cursor()
+                cursor.execute('''
+                SELECT c.name, COALESCE(SUM(e.amount), 0) as total 
+                FROM expenses e 
+                JOIN categories c ON e.category_id = c.id 
+                WHERE e.user_id = ? 
+                GROUP BY c.name 
+                ORDER BY total DESC 
+                LIMIT 1
+                ''', (user_id,))
+                result = cursor.fetchone()
+                conn.close()
+
+                if result and result[1] > 0:
+                    return {'response': f"You've spent the most on {result[0]} (${result[1]:.2f})."}
+                return {'response': "You haven't recorded any expenses yet."}
+            except sqlite3.Error as e:
+                print(f"Database error: {e}")
+                return {'response': "I couldn't analyze your spending right now."}
+
+        # Get user's expense context for general chat
+        try:
+            conn = sqlite3.connect(app.config['DATABASE'])
+            cursor = conn.cursor()
+
+            cursor.execute('''
+            SELECT e.title, e.amount, c.name, e.date 
+            FROM expenses e 
+            JOIN categories c ON e.category_id = c.id 
+            WHERE e.user_id = ? 
+            ORDER BY e.date DESC 
+            LIMIT 5
+            ''', (user_id,))
+            recent_expenses = cursor.fetchall()
+
+            cursor.execute('''
+            SELECT c.name, COALESCE(SUM(e.amount), 0)
+            FROM expenses e 
+            JOIN categories c ON e.category_id = c.id 
+            WHERE e.user_id = ? 
+            GROUP BY c.name
+            ''', (user_id,))
+            category_totals = cursor.fetchall()
+
+            conn.close()
+
+            context = "User's recent expenses:\n"
+            for expense in recent_expenses:
+                context += f"{expense[0]} - ${expense[1]:.2f} ({expense[2]}) on {expense[3]}\n"
+
+            context += "\nCategory totals:\n"
+            for cat in category_totals:
+                context += f"{cat[0]}: ${cat[1]:.2f}\n"
+
+            prompt = f"""You are a helpful financial assistant. The user has asked: "{message}"
+
+            Here is the user's financial context:
+            {context}
+
+            Provide a helpful response focused on their expenses and finances."""
+
+            response = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=200
+            )
+
+            return {'response': response.choices[0].message.content.strip()}
+        except sqlite3.Error as e:
+            print(f"Database error: {e}")
+            return {'response': "I couldn't access your financial data right now."}
+        except Exception as e:
+            print(f"OpenAI error: {e}")
+            return {'response': "I'm having trouble generating a response right now."}
+
+    except Exception as e:
+        print(f"Unexpected error in chat_with_ai: {e}")
+        return {'response': "I'm having trouble responding right now. Please try again later."}
+
+
+def allowed_file(filename):
+    return '.' in filename and \
+        filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']
+
+
+def extract_text_from_image(image_path):
+    try:
+        img = Image.open(image_path)
+        text = pytesseract.image_to_string(img)
+        return text
+    except Exception as e:
+        print(f"OCR Error: {e}")
+        return None
+
+
+def process_receipt_text(text):
+    try:
+        prompt = f"""Extract the following information from this receipt text:
+        - Total amount
+        - Date
+        - Merchant/store name
+        - Main items purchased
+
+        Receipt text:
+        {text}
+
+        Return the information in JSON format with keys: total, date, merchant, items."""
+
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=300
+        )
+
+        return json.loads(response.choices[0].message.content.strip())
+    except Exception as e:
+        print(f"Receipt Processing Error: {e}")
+        return None
+
+
+def generate_budget_recommendations(user_id):
+    conn = sqlite3.connect(app.config['DATABASE'])
+    df = pd.read_sql_query(f"""
+    SELECT c.name as category, SUM(e.amount) as total, COUNT(*) as count
+    FROM expenses e 
+    JOIN categories c ON e.category_id = c.id 
+    WHERE e.user_id = {user_id} 
+    GROUP BY c.name
+    ORDER BY total DESC
+    """, conn)
+
+    cursor = conn.cursor()
+    cursor.execute("SELECT monthly_income FROM users WHERE id = ?", (user_id,))
+    monthly_income = cursor.fetchone()[0] or 3000
+    conn.close()
+
+    if len(df) == 0:
+        return None
+
+    df['percentage'] = (df['total'] / df['total'].sum()) * 100
+    recommendations = []
+    for _, row in df.iterrows():
+        category = row['category']
+        avg_spending = row['total'] / row['count']
+
+        if row['percentage'] > 30:
+            recommendation = f"Reduce spending on {category}. Currently {row['percentage']:.1f}% of total expenses."
+            target = avg_spending * 0.8
+        else:
+            recommendation = f"Maintain spending on {category} at current levels."
+            target = avg_spending
+
+        recommendations.append({
+            'category': category,
+            'current_avg': round(avg_spending, 2),
+            'recommended': round(target, 2),
+            'advice': recommendation
+        })
+
+    total_monthly = df['total'].sum()
+    savings_rate = ((monthly_income - total_monthly) / monthly_income) * 100
+
+    if savings_rate < 10:
+        recommendations.append({
+            'category': 'Overall',
+            'current_avg': round(total_monthly, 2),
+            'recommended': round(total_monthly * 0.9, 2),
+            'advice': f"Try to save more. Current savings rate is {savings_rate:.1f}% of income."
+        })
+
+    return recommendations
+
+
+def send_reset_email(user_email, token):
+    try:
+        reset_link = url_for('reset_password', token=token, _external=True)
+        msg = MIMEText(f'''To reset your password, visit the following link:
+{reset_link}
+
+This link will expire in 1 hour.''')
+        msg['Subject'] = 'Password Reset Request'
+        msg['To'] = user_email
+
+        with smtplib.SMTP(app.config['MAIL_SERVER'], app.config['MAIL_PORT']) as server:
+            server.starttls()
+            server.login(app.config['MAIL_USERNAME'], app.config['MAIL_PASSWORD'])
+            server.send_message(msg)
+        return True
+    except Exception as e:
+        print(f"Error sending email: {e}")
+        return False
+
+
+def generate_reset_token(user_id):
+    conn = sqlite3.connect(app.config['DATABASE'])
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM reset_tokens WHERE user_id = ?", (user_id,))
+    token = secrets.token_urlsafe(32)
+    expires_at = datetime.now() + timedelta(hours=1)
+    cursor.execute("INSERT INTO reset_tokens (user_id, token, expires_at) VALUES (?, ?, ?)",
+                   (user_id, token, expires_at))
+    conn.commit()
+    conn.close()
+    return token
+
+
+def verify_reset_token(token):
+    conn = sqlite3.connect(app.config['DATABASE'])
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id, expires_at FROM reset_tokens WHERE token = ?", (token,))
+    token_data = cursor.fetchone()
+
+    if not token_data:
+        conn.close()
+        return None
+
+    user_id, expires_at = token_data
+    if datetime.now() > datetime.strptime(expires_at, '%Y-%m-%d %H:%M:%S.%f'):
+        cursor.execute("DELETE FROM reset_tokens WHERE token = ?", (token,))
+        conn.commit()
+        conn.close()
+        return None
+
+    cursor.execute("SELECT id, username, email FROM users WHERE id = ?", (user_id,))
+    user_data = cursor.fetchone()
+    conn.close()
+
+    if user_data:
+        return User(id=user_data[0], username=user_data[1], email=user_data[2])
+    return None
+
+
+# Routes
+@app.route('/')
+def home():
+    if current_user.is_authenticated:
+        return redirect(url_for('dashboard'))
+    return render_template('home.html')
+
+
+@app.route('/dashboard')
+@login_required
+def dashboard():
+    conn = sqlite3.connect(app.config['DATABASE'])
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT SUM(amount) FROM expenses WHERE user_id = ?", (current_user.id,))
+    total_expenses = cursor.fetchone()[0] or 0
+
+    cursor.execute('''
+    SELECT e.id, e.title, e.amount, c.name as category, e.date 
+    FROM expenses e 
+    JOIN categories c ON e.category_id = c.id 
+    WHERE e.user_id = ? 
+    ORDER BY e.date DESC 
+    LIMIT 5
+    ''', (current_user.id,))
+    recent_expenses = cursor.fetchall()
+
+    cursor.execute('''
+    SELECT c.name, SUM(e.amount) as total
+    FROM expenses e 
+    JOIN categories c ON e.category_id = c.id 
+    WHERE e.user_id = ? 
+    GROUP BY c.name
+    ORDER BY total DESC
+    ''', (current_user.id,))
+    category_totals = cursor.fetchall()
+
+    cursor.execute('''
+    SELECT strftime('%Y-%m', date) as month, SUM(amount) 
+    FROM expenses 
+    WHERE user_id = ? 
+    GROUP BY month 
+    ORDER BY month
+    ''', (current_user.id,))
+    monthly_data = cursor.fetchall()
+
+    line_labels = [row[0] for row in monthly_data]
+    line_values = [row[1] for row in monthly_data]
+
+    tips = generate_financial_tips(current_user.id)
+    conn.close()
+
+    return render_template(
+        'dashboard.html',
+        total_expenses=total_expenses,
+        recent_expenses=recent_expenses,
+        category_totals=category_totals,
+        line_labels=json.dumps(line_labels),
+        line_values=json.dumps(line_values),
+        tips=tips
+    )
+
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if current_user.is_authenticated:
+        return redirect(url_for('dashboard'))
+
+    if request.method == 'POST':
+        username = request.form.get('username', '').strip()
+        password = request.form.get('password', '').encode('utf-8')  # Encode password to bytes
+
+        if not username or not password:
+            flash('Username and password are required', 'danger')
+            return redirect(url_for('login'))
+
+        conn = None
+        try:
+            conn = sqlite3.connect(app.config['DATABASE'])
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT id, username, email, password FROM users WHERE username = ?",
+                (username,)
+            )
+            user_data = cursor.fetchone()
+
+            if user_data:
+                stored_hash = user_data[3]
+                try:
+                    if bcrypt.check_password_hash(stored_hash, password):
+                        user = User(id=user_data[0], username=user_data[1], email=user_data[2])
+                        login_user(user)
+                        next_page = request.args.get('next')
+                        return redirect(next_page or url_for('dashboard'))
+                    else:
+                        flash('Invalid username or password', 'danger')
+                except ValueError as e:
+                    print(f"Password verification error: {e}")
+                    flash('Login error. Please try again.', 'danger')
+            else:
+                flash('Invalid username or password', 'danger')
+
+        except Exception as e:
+            print(f"Database error during login: {e}")
+            flash('Login failed due to system error', 'danger')
+        finally:
+            if conn:
+                conn.close()
+
+    return render_template('auth/login.html')
+
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if current_user.is_authenticated:
+        return redirect(url_for('dashboard'))
+
+    if request.method == 'POST':
+        username = request.form.get('username', '').strip()
+        email = request.form.get('email', '').strip().lower()
+        password = request.form.get('password', '').encode('utf-8')  # Encode password to bytes
+        confirm_password = request.form.get('confirm_password', '').encode('utf-8')
+
+        # Validation checks
+        if not username or not email or not password or not confirm_password:
+            flash('All fields are required', 'danger')
+            return redirect(url_for('register'))
+
+        if password != confirm_password:
+            flash('Passwords do not match!', 'danger')
+            return redirect(url_for('register'))
+
+        if len(password) < 8:
+            flash('Password must be at least 8 characters', 'danger')
+            return redirect(url_for('register'))
+
+        # Hash the password
+        try:
+            hashed_password = bcrypt.generate_password_hash(password).decode('utf-8')
+        except Exception as e:
+            print(f"Password hashing error: {e}")
+            flash('Registration error. Please try again.', 'danger')
+            return redirect(url_for('register'))
+
+        conn = None
+        try:
+            conn = sqlite3.connect(app.config['DATABASE'])
+            cursor = conn.cursor()
+
+            # Check if username or email already exists
+            cursor.execute(
+                "SELECT id FROM users WHERE username = ? OR email = ?",
+                (username, email)
+            )
+            if cursor.fetchone():
+                flash('Username or email already exists!', 'danger')
+                return redirect(url_for('register'))
+
+            # Insert new user
+            cursor.execute(
+                "INSERT INTO users (username, email, password) VALUES (?, ?, ?)",
+                (username, email, hashed_password)
+            )
+            conn.commit()
+            flash('Registration successful! Please login.', 'success')
+            return redirect(url_for('login'))
+
+        except sqlite3.Error as e:
+            print(f"Database error during registration: {e}")
+            flash('Registration failed due to system error', 'danger')
+        finally:
+            if conn:
+                conn.close()
+
+    return render_template('auth/register.html')
+
+
+
+@app.route('/logout')
+@login_required
+def logout():
+    logout_user()
+    return redirect(url_for('login'))
+
+
+@app.route('/reset_request', methods=['GET', 'POST'])
+def reset_request():
+    if current_user.is_authenticated:
+        return redirect(url_for('dashboard'))
+
+    if request.method == 'POST':
+        email = request.form['email']
+
+        conn = sqlite3.connect(app.config['DATABASE'])
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, username, email FROM users WHERE email = ?", (email,))
+        user_data = cursor.fetchone()
+        conn.close()
+
+        if user_data:
+            user = User(id=user_data[0], username=user_data[1], email=user_data[2])
+            token = generate_reset_token(user.id)
+            if send_reset_email(user.email, token):
+                flash('Password reset email sent. Check your inbox.', 'info')
+            else:
+                flash('Could not send reset email. Please try again.', 'danger')
+            return redirect(url_for('login'))
+
+        flash('No account found with that email.', 'warning')
+
+    return render_template('auth/reset_request.html')
+
+
+@app.route('/reset_password/<token>', methods=['GET', 'POST'])
+def reset_password(token):
+    if current_user.is_authenticated:
+        return redirect(url_for('dashboard'))
+
+    user = verify_reset_token(token)
+    if not user:
+        flash('Invalid or expired token.', 'danger')
+        return redirect(url_for('reset_request'))
+
+    if request.method == 'POST':
+        password = request.form['password']
+        confirm_password = request.form['confirm_password']
+
+        if password != confirm_password:
+            flash('Passwords do not match!', 'danger')
+            return redirect(url_for('reset_password', token=token))
+
+        hashed_password = bcrypt.generate_password_hash(password).decode('utf-8')
+
+        conn = sqlite3.connect(app.config['DATABASE'])
+        cursor = conn.cursor()
+        cursor.execute("UPDATE users SET password = ? WHERE id = ?", (hashed_password, user.id))
+        cursor.execute("DELETE FROM reset_tokens WHERE user_id = ?", (user.id,))
+        conn.commit()
+        conn.close()
+
+        flash('Your password has been updated! You can now login.', 'success')
+        return redirect(url_for('login'))
+
+    return render_template('auth/reset_password.html', token=token)
+
+
+@app.route('/expenses')
+@login_required
+def expenses():
+    conn = sqlite3.connect(app.config['DATABASE'])
+    cursor = conn.cursor()
+
+    category_filter = request.args.get('category')
+    date_from = request.args.get('date_from')
+    date_to = request.args.get('date_to')
+    search_query = request.args.get('search')
+
+    query = '''
+    SELECT e.id, e.title, e.amount, c.name as category, e.date 
+    FROM expenses e 
+    JOIN categories c ON e.category_id = c.id 
+    WHERE e.user_id = ?
+    '''
+    params = [current_user.id]
+
+    if category_filter:
+        query += " AND c.name = ?"
+        params.append(category_filter)
+
+    if date_from:
+        query += " AND e.date >= ?"
+        params.append(date_from)
+
+    if date_to:
+        query += " AND e.date <= ?"
+        params.append(date_to)
+
+    if search_query:
+        query += " AND (e.title LIKE ? OR e.notes LIKE ?)"
+        params.extend([f"%{search_query}%", f"%{search_query}%"])
+
+    query += " ORDER BY e.date DESC"
+
+    expenses = cursor.execute(query, params).fetchall()
+
+    categories = cursor.execute(
+        "SELECT name FROM categories WHERE user_id = ? OR is_default = 1",
+        (current_user.id,)
+    ).fetchall()
+
+    conn.close()
+
+    return render_template(
+        'expenses/index.html',
+        expenses=expenses,
+        categories=categories
+    )
+
+
+@app.route('/expenses/add', methods=['GET', 'POST'])
+@login_required
+def add_expense():
+    if request.method == 'POST':
+        title = request.form['title']
+        amount = request.form['amount']
+        category_name = request.form.get('category') or ai_categorize_expense(title)
+        date = request.form['date']
+        notes = request.form.get('notes', '')
+
+        conn = sqlite3.connect(app.config['DATABASE'])
+        cursor = conn.cursor()
+
+        cursor.execute(
+            "SELECT id FROM categories WHERE name = ? AND (user_id = ? OR is_default = 1)",
+            (category_name, current_user.id)
+        )
+        category = cursor.fetchone()
+
+        if not category:
+            cursor.execute(
+                "INSERT INTO categories (name, user_id) VALUES (?, ?)",
+                (category_name, current_user.id)
+            )
+            conn.commit()
+            category_id = cursor.lastrowid
+        else:
+            category_id = category[0]
+
+        cursor.execute('''
+        INSERT INTO expenses (user_id, title, amount, category_id, date, notes) 
+        VALUES (?, ?, ?, ?, ?, ?)
+        ''', (current_user.id, title, amount, category_id, date, notes))
+
+        conn.commit()
+        conn.close()
+
+        flash('Expense added successfully!', 'success')
+        return redirect(url_for('expenses'))
+
+    conn = sqlite3.connect(app.config['DATABASE'])
+    cursor = conn.cursor()
+    categories = cursor.execute(
+        "SELECT name FROM categories WHERE user_id = ? OR is_default = 1",
+        (current_user.id,)
+    ).fetchall()
+    conn.close()
+
+    return render_template(
+        'expenses/add.html',
+        categories=categories,
+        today=datetime.now().strftime('%Y-%m-%d')
+    )
+
+
+@app.route('/expenses/edit/<int:id>', methods=['GET', 'POST'])
+@login_required
+def edit_expense(id):
+    conn = sqlite3.connect(app.config['DATABASE'])
+    cursor = conn.cursor()
+
+    if request.method == 'POST':
+        title = request.form['title']
+        amount = request.form['amount']
+        category_name = request.form['category']
+        date = request.form['date']
+        notes = request.form.get('notes', '')
+
+        cursor.execute(
+            "SELECT id FROM categories WHERE name = ? AND (user_id = ? OR is_default = 1)",
+            (category_name, current_user.id)
+        )
+        category = cursor.fetchone()
+
+        if not category:
+            cursor.execute(
+                "INSERT INTO categories (name, user_id) VALUES (?, ?)",
+                (category_name, current_user.id)
+            )
+            conn.commit()
+            category_id = cursor.lastrowid
+        else:
+            category_id = category[0]
+
+        cursor.execute('''
+        UPDATE expenses 
+        SET title = ?, amount = ?, category_id = ?, date = ?, notes = ?
+        WHERE id = ? AND user_id = ?
+        ''', (title, amount, category_id, date, notes, id, current_user.id))
+
+        conn.commit()
+        conn.close()
+        flash('Expense updated successfully!', 'success')
+        return redirect(url_for('expenses'))
+
+    cursor.execute('''
+    SELECT e.id, e.title, e.amount, c.name, e.date, e.notes 
+    FROM expenses e 
+    JOIN categories c ON e.category_id = c.id 
+    WHERE e.id = ? AND e.user_id = ?
+    ''', (id, current_user.id))
+    expense = cursor.fetchone()
+
+    if not expense:
+        conn.close()
+        flash('Expense not found!', 'danger')
+        return redirect(url_for('expenses'))
+
+    cursor.execute(
+        "SELECT name FROM categories WHERE user_id = ? OR is_default = 1",
+        (current_user.id,)
+    )
+    categories = [row[0] for row in cursor.fetchall()]
+    conn.close()
+
+    return render_template(
+        'expenses/edit.html',
+        expense=expense,
+        categories=categories
+    )
+
+
+@app.route('/expenses/delete/<int:id>')
+@login_required
+def delete_expense(id):
+    conn = sqlite3.connect(app.config['DATABASE'])
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM expenses WHERE id = ? AND user_id = ?", (id, current_user.id))
+    conn.commit()
+    conn.close()
+    flash('Expense deleted successfully!', 'success')
+    return redirect(url_for('expenses'))
+
+
+@app.route('/categories')
+@login_required
+def manage_categories():
+    conn = sqlite3.connect(app.config['DATABASE'])
+    cursor = conn.cursor()
+
+    cursor.execute('''
+    SELECT id, name, is_default 
+    FROM categories 
+    WHERE user_id = ? OR is_default = 1 
+    ORDER BY is_default DESC, name
+    ''', (current_user.id,))
+    categories = cursor.fetchall()
+
+    conn.close()
+    return render_template('categories/manage_categories.html', categories=categories)
+
+
+@app.route('/categories/add', methods=['GET', 'POST'])
+@login_required
+def add_category():
+    if request.method == 'POST':
+        name = request.form['name']
+
+        conn = sqlite3.connect(app.config['DATABASE'])
+        cursor = conn.cursor()
+
+        cursor.execute(
+            "SELECT id FROM categories WHERE name = ? AND (user_id = ? OR is_default = 1)",
+            (name, current_user.id)
+        )
+        if cursor.fetchone():
+            flash('Category already exists!', 'danger')
+            conn.close()
+            return redirect(url_for('add_category'))
+
+        cursor.execute(
+            "INSERT INTO categories (name, user_id) VALUES (?, ?)",
+            (name, current_user.id)
+        )
+        conn.commit()
+        conn.close()
+        flash('Category added successfully!', 'success')
+        return redirect(url_for('manage_categories'))
+
+    return render_template('categories/add_category.html')
+
+
+@app.route('/categories/delete/<int:id>')
+@login_required
+def delete_category(id):
+    conn = sqlite3.connect(app.config['DATABASE'])
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT is_default FROM categories WHERE id = ?", (id,))
+    category = cursor.fetchone()
+
+    if not category:
+        flash('Category not found!', 'danger')
+    elif category[0]:
+        flash('Cannot delete default categories!', 'danger')
+    else:
+        cursor.execute(
+            "SELECT id FROM expenses WHERE category_id = ? AND user_id = ? LIMIT 1",
+            (id, current_user.id)
+        )
+        if cursor.fetchone():
+            flash('Cannot delete category that is in use!', 'danger')
+        else:
+            cursor.execute(
+                "DELETE FROM categories WHERE id = ? AND user_id = ?",
+                (id, current_user.id)
+            )
+            conn.commit()
+            flash('Category deleted successfully!', 'success')
+
+    conn.close()
+    return redirect(url_for('manage_categories'))
+
+
+@app.route('/categories/<int:id>')
+@login_required
+def category_expenses(id):
+    conn = sqlite3.connect(app.config['DATABASE'])
+    cursor = conn.cursor()
+
+    cursor.execute(
+        "SELECT name FROM categories WHERE id = ? AND (user_id = ? OR is_default = 1)",
+        (id, current_user.id)
+    )
+    category = cursor.fetchone()
+
+    if not category:
+        conn.close()
+        flash('Category not found!', 'danger')
+        return redirect(url_for('manage_categories'))
+
+    cursor.execute('''
+    SELECT e.id, e.title, e.amount, e.date 
+    FROM expenses e 
+    WHERE e.category_id = ? AND e.user_id = ? 
+    ORDER BY e.date DESC
+    ''', (id, current_user.id))
+    expenses = cursor.fetchall()
+
+    conn.close()
+    return render_template(
+        'categories/category_expenses.html',
+        category_name=category[0],
+        expenses=expenses
+    )
+
+
+@app.route('/reports')
+@login_required
+def reports():
+    conn = sqlite3.connect(app.config['DATABASE'])
+    cursor = conn.cursor()
+
+    cursor.execute('''
+    SELECT strftime('%Y-%m', date) as month, SUM(amount) 
+    FROM expenses 
+    WHERE user_id = ? 
+    GROUP BY month 
+    ORDER BY month DESC
+    ''', (current_user.id,))
+    monthly_summary = cursor.fetchall()
+
+    cursor.execute('''
+    SELECT strftime('%Y', date) as year, SUM(amount) 
+    FROM expenses 
+    WHERE user_id = ? 
+    GROUP BY year 
+    ORDER BY year DESC
+    ''', (current_user.id,))
+    yearly_summary = cursor.fetchall()
+
+    conn.close()
+    return render_template(
+        'reports/reports.html',
+        monthly_summary=monthly_summary,
+        yearly_summary=yearly_summary
+    )
+
+
+@app.route('/analytics')
+@login_required
+def analytics():
+    conn = sqlite3.connect(app.config['DATABASE'])
+    cursor = conn.cursor()
+
+    cursor.execute('''
+    SELECT c.name, SUM(e.amount) 
+    FROM expenses e 
+    JOIN categories c ON e.category_id = c.id 
+    WHERE e.user_id = ? 
+    GROUP BY c.name
+    ''', (current_user.id,))
+    category_data = cursor.fetchall()
+
+    pie_labels = [row[0] for row in category_data]
+    pie_values = [row[1] for row in category_data]
+
+    cursor.execute('''
+    SELECT strftime('%Y-%m', date) as month, SUM(amount) 
+    FROM expenses 
+    WHERE user_id = ? 
+    GROUP BY month 
+    ORDER BY month
+    ''', (current_user.id,))
+    monthly_data = cursor.fetchall()
+
+    line_labels = [row[0] for row in monthly_data]
+    line_values = [row[1] for row in monthly_data]
+
+    cursor.execute('''
+    SELECT strftime('%Y-%W', date) as week, SUM(amount) 
+    FROM expenses 
+    WHERE user_id = ? 
+    GROUP BY week 
+    ORDER BY week
+    LIMIT 12
+    ''', (current_user.id,))
+    weekly_data = cursor.fetchall()
+
+    weekly_labels = [f"Week {row[0].split('-')[1]}" for row in weekly_data]
+    weekly_values = [row[1] for row in weekly_data]
+
+    conn.close()
+
+    return render_template(
+        'reports/analytics.html',
+        pie_labels=json.dumps(pie_labels),
+        pie_values=json.dumps(pie_values),
+        line_labels=json.dumps(line_labels),
+        line_values=json.dumps(line_values),
+        weekly_labels=json.dumps(weekly_labels),
+        weekly_values=json.dumps(weekly_values)
+    )
+
+
+@app.route('/predictions')
+@login_required
+def show_predictions():
+    predictions = predict_future_expenses(current_user.id)
+    return render_template('ai/predictions.html', predictions=predictions)
+
+
+@app.route('/anomalies')
+@login_required
+def show_anomalies():
+    anomalies = detect_spending_anomalies(current_user.id)
+    return render_template('ai/anomalies.html', anomalies=anomalies)
+
+
+@app.route('/tips')
+@login_required
+def show_tips():
+    tips = generate_financial_tips(current_user.id)
+    return render_template('ai/tips.html', tips=tips)
+
+
+@app.route('/chat', methods=['GET', 'POST'])
+@login_required
+def chat():
+    if request.method == 'POST':
+        message = request.form['message']
+        response = chat_with_ai(current_user.id, message)
+        return jsonify(response)
+
+    return render_template('ai/chat.html')
+
+
+@app.route('/voice_command', methods=['POST'])
+@login_required
+def voice_command():
+    if 'audio' not in request.files:
+        return jsonify({'error': 'No audio file'}), 400
+
+    audio_file = request.files['audio']
+
+    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+        audio_file.save(tmp.name)
+
+        with sr.AudioFile(tmp.name) as source:
+            audio = r.record(source)
+            try:
+                text = r.recognize_google(audio)
+                response = chat_with_ai(current_user.id, text)
+
+                tts = gTTS(text=response['response'], lang='en')
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as audio_tmp:
+                    tts.save(audio_tmp.name)
+                    return jsonify({
+                        'text': text,
+                        'response': response['response'],
+                        'audio_url': url_for('static', filename=os.path.basename(audio_tmp.name))
+                    })
+            except sr.UnknownValueError:
+                return jsonify({'error': 'Could not understand audio'}), 400
+            except sr.RequestError:
+                return jsonify({'error': 'Speech recognition service error'}), 500
+
+
+@app.route('/receipt', methods=['GET', 'POST'])
+@login_required
+def receipt_scan():
+    pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+
+    if request.method == 'POST':
+        try:
+            # Validate file upload
+            if 'file' not in request.files:
+                flash('No file selected', 'danger')
+                return redirect(request.url)
+
+            file = request.files['file']
+            if file.filename == '':
+                flash('No file selected', 'danger')
+                return redirect(request.url)
+
+            if not (file and allowed_file(file.filename)):
+                flash('Invalid file type', 'danger')
+                return redirect(request.url)
+
+            # Secure filename and create upload directory
+            filename = secure_filename(
+                f"user_{current_user.id}_{datetime.now().strftime('%Y%m%d%H%M%S')}.{file.filename.rsplit('.', 1)[1].lower()}")
+            os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+            filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+            file.save(filepath)
+
+            # Enhanced Image Preprocessing
+            def preprocess_image(img_path):
+                try:
+                    img = Image.open(img_path)
+                    img = img.convert('L')  # Grayscale
+
+                    # Enhance image quality
+                    enhancer = ImageEnhance.Contrast(img)
+                    img = enhancer.enhance(2.0)
+                    img = img.point(lambda x: 0 if x < 140 else 255)  # Binarization
+                    img = img.filter(ImageFilter.MedianFilter(size=3))  # Noise reduction
+                    img = img.filter(ImageFilter.SHARPEN)  # Sharpening
+
+                    return img
+                except Exception as e:
+                    logging.error(f"Image preprocessing failed: {str(e)}")
+                    raise ValueError("Failed to process receipt image quality")
+
+            # OCR Processing with multiple attempts
+            def perform_ocr(img_path):
+                try:
+                    processed_img = preprocess_image(img_path)
+
+                    # Try different configurations
+                    for lang in ['eng', 'eng+por+spa']:
+                        for psm in [6, 4, 11]:  # Try different segmentation modes
+                            try:
+                                custom_config = f'--oem 3 --psm {psm} -l {lang}'
+                                text = pytesseract.image_to_string(
+                                    processed_img,
+                                    config=custom_config
+                                )
+                                if text.strip():
+                                    return text
+                            except:
+                                continue
+
+                    raise ValueError("OCR failed after multiple attempts")
+                except Exception as e:
+                    logging.error(f"OCR processing failed: {str(e)}")
+                    raise ValueError("Could not read receipt text")
+
+            # Advanced Receipt Parsing
+            def parse_receipt_text(text):
+                try:
+                    result = {
+                        'total': None,
+                        'date': None,
+                        'merchant': None,
+                        'items': []
+                    }
+
+                    # Clean and normalize text
+                    text = text.replace(',', '.').upper()
+                    lines = [line.strip() for line in text.split('\n') if line.strip()]
+
+                    # Merchant detection (first meaningful line)
+                    if lines:
+                        result['merchant'] = lines[0]
+
+                    # Total amount detection
+                    total_patterns = [
+                        r'TOTAL.*?(\d+\.\d{2})',
+                        r'(\d+\.\d{2}).*?TOTAL',
+                        r'AMOUNT DUE.*?(\d+\.\d{2})',
+                        r'(\d+\.\d{2})\s*$'
+                    ]
+
+                    for pattern in total_patterns:
+                        match = re.search(pattern, text)
+                        if match:
+                            result['total'] = match.group(1)
+                            break
+
+                    # Date detection
+                    date_patterns = [
+                        r'\d{2}/\d{2}/\d{4}',
+                        r'\d{4}-\d{2}-\d{2}',
+                        r'\d{2} [A-Z]{3} \d{4}'
+                    ]
+
+                    for pattern in date_patterns:
+                        match = re.search(pattern, text)
+                        if match:
+                            result['date'] = match.group()
+                            break
+
+                    # Item parsing
+                    price_pattern = r'\d+\.\d{2}'
+                    for line in lines:
+                        if re.search(price_pattern, line):
+                            parts = re.split(r'\s{2,}|\t', line)
+                            if len(parts) >= 2:
+                                item_name = ' '.join(parts[:-1])
+                                price = parts[-1]
+                                if float(price) > 0:  # Validate positive amount
+                                    result['items'].append({
+                                        'name': item_name,
+                                        'price': price
+                                    })
+
+                    return result
+                except Exception as e:
+                    logging.error(f"Receipt parsing failed: {str(e)}")
+                    raise ValueError("Could not extract receipt data")
+
+            # Main processing flow
+            try:
+                ocr_text = perform_ocr(filepath)
+                receipt_data = parse_receipt_text(ocr_text)
+
+                # Validate minimum data requirements
+                if not receipt_data.get('items') and not receipt_data.get('total'):
+                    raise ValueError("Insufficient receipt data extracted")
+
+            except ValueError as e:
+                flash(f'Processing Error: {str(e)}', 'danger')
+                return redirect(request.url)
+            except Exception as e:
+                flash('An error occurred during receipt processing', 'danger')
+                logging.exception("Receipt processing error")
+                return redirect(request.url)
+
+            # Get categories for dropdown
+            try:
+                conn = sqlite3.connect(app.config['DATABASE'])
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT name FROM categories WHERE user_id = ? OR is_default = 1",
+                    (current_user.id,)
+                )
+                categories = [row[0] for row in cursor.fetchall()]
+            except sqlite3.Error as e:
+                logging.error(f"Database error: {str(e)}")
+                categories = []
+            finally:
+                conn.close()
+
+            return render_template(
+                'ai/receipt_result.html',
+                receipt_data=receipt_data,
+                ocr_text=ocr_text,
+                categories=categories,
+                filename=filename
+            )
+
+        except Exception as e:
+            flash('An unexpected error occurred', 'danger')
+            logging.exception("Unexpected error in receipt processing")
+            return redirect(request.url)
+
+    return render_template('ai/receipt_upload.html')
+
+
+def process_receipt_text(text):
+    try:
+        receipt_data = {
+            'total': None,
+            'date': None,
+            'merchant': None,
+            'items': []
+        }
+
+        # Clean and normalize text
+        text = text.replace(',', '.').upper()  # Standardize decimal points
+
+        # 1. Merchant Detection (first non-empty line)
+        lines = [line.strip() for line in text.split('\n') if line.strip()]
+        if lines:
+            receipt_data['merchant'] = lines[0]
+
+        # 2. Total Amount Detection (multiple robust patterns)
+        total_patterns = [
+            r'TOTAL.*?(\d+\.\d{2})',  # "TOTAL $10.99"
+            r'(\d+\.\d{2}).*?TOTAL',  # "10.99 TOTAL"
+            r'AMOUNT DUE.*?(\d+\.\d{2})',
+            r'(\d+\.\d{2})\s*$'  # Amount at line end
+        ]
+
+        for pattern in total_patterns:
+            match = re.search(pattern, text)
+            if match:
+                receipt_data['total'] = match.group(1)
+                break
+
+        # 3. Date Detection (multiple formats)
+        date_patterns = [
+            r'\d{2}/\d{2}/\d{4}',  # MM/DD/YYYY
+            r'\d{4}-\d{2}-\d{2}',  # YYYY-MM-DD
+            r'\d{2} [A-Z]{3} \d{4}'  # 22 MAY 2024
+        ]
+
+        for pattern in date_patterns:
+            match = re.search(pattern, text)
+            if match:
+                receipt_data['date'] = match.group()
+                break
+
+        # 4. Item Line Detection (improved logic)
+        price_pattern = r'\d+\.\d{2}'
+        for line in lines:
+            if re.search(price_pattern, line):
+                # Split on 2+ spaces or tabs
+                parts = re.split(r'\s{2,}|\t', line)
+                if len(parts) >= 2:
+                    item_name = ' '.join(parts[:-1])
+                    price = parts[-1]
+                    if float(price) > 0:  # Validate it's a positive amount
+                        receipt_data['items'].append({
+                            'name': item_name,
+                            'price': price
+                        })
+
+        # Validate minimum required data
+        if not receipt_data['items'] and not receipt_data['total']:
+            raise ValueError("Insufficient receipt data extracted")
+
+        return receipt_data
+
+    except Exception as e:
+        app.logger.error(f"Receipt parsing failed: {str(e)}")
+        raise ValueError("Could not parse receipt data")
+
+
+
+
+def preprocess_image(img_path):
+    try:
+        img = Image.open(img_path)
+        img = img.convert('L')  # Grayscale
+
+        # Contrast enhancement
+        enhancer = ImageEnhance.Contrast(img)
+        img = enhancer.enhance(2.0)
+
+        # Binarization
+        img = img.point(lambda x: 0 if x < 140 else 255)
+
+        # Noise reduction - THIS WAS MISSING
+        img = img.filter(ImageFilter.MedianFilter(size=3))
+
+        return img
+    except Exception as e:
+        app.logger.error(f"Image processing failed: {str(e)}")
+        raise ValueError("Failed to process receipt image quality")
+
+
+@app.route('/budget_recommendations')
+@login_required
+def show_budget_recommendations():
+    recommendations = generate_budget_recommendations(current_user.id)
+    return render_template('ai/budget_recommendations.html', recommendations=recommendations)
+
+
+@app.route('/reminders')
+@login_required
+def view_reminders():
+    return render_template('ai/reminders.html', reminders=current_user.reminders)
+
+
+@app.route('/add_reminder', methods=['POST'])
+@login_required
+def add_reminder():
+    description = request.form['description']
+    due_date = request.form['due_date']
+    recurring = request.form.get('recurring', 'none')
+
+    reminder_id = current_user.add_reminder(description, due_date, recurring)
+    flash('Reminder added successfully!', 'success')
+    return redirect(url_for('view_reminders'))
+
+
+@app.route('/complete_reminder/<int:id>')
+@login_required
+def complete_reminder(id):
+    conn = sqlite3.connect(app.config['DATABASE'])
+    cursor = conn.cursor()
+    cursor.execute('''
+    UPDATE reminders 
+    SET completed = 1 
+    WHERE id = ? AND user_id = ?
+    ''', (id, current_user.id))
+    conn.commit()
+    conn.close()
+
+    current_user._reminders = None
+    flash('Reminder marked as completed!', 'success')
+    return redirect(url_for('view_reminders'))
+
+
+@app.route('/settings', methods=['GET', 'POST'])
+@login_required
+def settings():
+    if request.method == 'POST':
+        if 'current_password' in request.form:
+            current_password = request.form['current_password']
+            new_password = request.form['new_password']
+            confirm_password = request.form['confirm_password']
+
+            if new_password != confirm_password:
+                flash('New passwords do not match!', 'danger')
+                return redirect(url_for('settings'))
+
+            conn = sqlite3.connect(app.config['DATABASE'])
+            cursor = conn.cursor()
+            cursor.execute("SELECT password FROM users WHERE id = ?", (current_user.id,))
+            user = cursor.fetchone()
+
+            if user and check_password_hash(user[0], current_password):
+                hashed_password = generate_password_hash(new_password)
+                cursor.execute("UPDATE users SET password = ? WHERE id = ?",
+                               (hashed_password, current_user.id))
+                conn.commit()
+                flash('Password changed successfully!', 'success')
+            else:
+                flash('Current password is incorrect!', 'danger')
+
+            conn.close()
+
+        elif 'income' in request.form:
+            monthly_income = float(request.form['income'])
+
+            conn = sqlite3.connect(app.config['DATABASE'])
+            cursor = conn.cursor()
+            cursor.execute("UPDATE users SET monthly_income = ? WHERE id = ?",
+                           (monthly_income, current_user.id))
+            conn.commit()
+            conn.close()
+
+            flash('Income updated successfully!', 'success')
+
+        elif 'theme' in request.form:
+            session['theme'] = request.form['theme']
+            flash('Theme preference updated!', 'success')
+
+    conn = sqlite3.connect(app.config['DATABASE'])
+    cursor = conn.cursor()
+    cursor.execute("SELECT monthly_income FROM users WHERE id = ?", (current_user.id,))
+    monthly_income = cursor.fetchone()[0] or 0
+    conn.close()
+
+    return render_template('settings.html', monthly_income=monthly_income)
+
+
+if __name__ == '__main__':
+    with app.app_context():
+        init_db()
+    app.run(host='0.0.0.0', port=5000, debug=True)
+
+2.ai_services.py
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import IsolationForest
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.neighbors import NearestNeighbors
+import nltk
+from nltk.corpus import stopwords
+from transformers import pipeline
+import torch
+import openai
+import os
+from PIL import Image
+import pytesseract
+import re
+from datetime import datetime, timedelta
+from collections import defaultdict
+
+# Initialize NLTK
+nltk.download('stopwords')
+stop_words = set(stopwords.words('english'))
+
+# Initialize OpenAI
+openai.api_key = ''
+
+
+class AIServices:
+    def __init__(self, db_path='expenses.db'):
+        self.db_path = db_path
+        self.classifier = None
+        self.vectorizer = None
+        self.nn_model = None
+        self.anomaly_detector = None
+        self.load_models()
+
+    def load_models(self):
+        """Load or train ML models"""
+        conn = sqlite3.connect(self.db_path)
+
+        # Load data for training models
+        try:
+            expenses_df = pd.read_sql(
+                "SELECT e.title, c.name as category FROM expenses e JOIN categories c ON e.category_id = c.id",
+                conn
+            )
+
+            # Train text classifier for categorization
+            if not expenses_df.empty:
+                self.vectorizer = TfidfVectorizer(stop_words=list(stop_words))
+                X = self.vectorizer.fit_transform(expenses_df['title'])
+                self.nn_model = NearestNeighbors(n_neighbors=1, algorithm='ball_tree').fit(X)
+                self.categories = expenses_df['category'].unique()
+
+            # Train anomaly detector
+            amounts_df = pd.read_sql(
+                "SELECT amount, date FROM expenses ORDER BY date",
+                conn
+            )
+            if not amounts_df.empty:
+                amounts_df['date'] = pd.to_datetime(amounts_df['date'])
+                amounts_df['day_of_week'] = amounts_df['date'].dt.dayofweek
+                amounts_df['day_of_month'] = amounts_df['date'].dt.day
+                amounts_df['month'] = amounts_df['date'].dt.month
+
+                X = amounts_df[['amount', 'day_of_week', 'day_of_month', 'month']]
+                self.anomaly_detector = IsolationForest(contamination=0.05)
+                self.anomaly_detector.fit(X)
+
+        except Exception as e:
+            print(f"Error loading models: {e}")
+        finally:
+            conn.close()
+
+    def categorize_expense(self, title):
+        """Predict category based on expense title"""
+        if not self.vectorizer or not self.nn_model:
+            return "Other"
+
+        try:
+            X = self.vectorizer.transform([title])
+            distances, indices = self.nn_model.kneighbors(X)
+            return self.categories[indices[0][0]]
+        except:
+            return "Other"
+
+    def detect_anomalies(self, amount, date):
+        """Detect if an expense is anomalous"""
+        if not self.anomaly_detector:
+            return False
+
+        try:
+            date = pd.to_datetime(date)
+            features = [[amount, date.dayofweek, date.day, date.month]]
+            return self.anomaly_detector.predict(features)[0] == -1
+        except:
+            return False
+
+    def predict_future_expenses(self, user_id, months=1):
+        """Predict future expenses based on historical data"""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            df = pd.read_sql(
+                f"SELECT amount, date FROM expenses WHERE user_id = {user_id} ORDER BY date",
+                conn
+            )
+
+            if len(df) < 10:  # Not enough data
+                return None
+
+            df['date'] = pd.to_datetime(df['date'])
+            df = df.set_index('date')
+            monthly = df.resample('M').sum()
+
+            # Simple moving average prediction
+            pred = monthly.rolling(3).mean().iloc[-1]['amount']
+            return pred * months
+        except Exception as e:
+            print(f"Prediction error: {e}")
+            return None
+        finally:
+            conn.close()
+
+    def get_financial_tips(self, user_id):
+        """Generate personalized financial tips"""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            # Get current month data
+            current_month = datetime.now().strftime('%Y-%m')
+            df_current = pd.read_sql(
+                f"""SELECT c.name as category, SUM(e.amount) as amount 
+                FROM expenses e JOIN categories c ON e.category_id = c.id 
+                WHERE e.user_id = {user_id} AND strftime('%Y-%m', e.date) = '{current_month}'
+                GROUP BY c.name""",
+                conn
+            )
+
+            # Get previous month data
+            prev_month = (datetime.now() - timedelta(days=30)).strftime('%Y-%m')
+            df_prev = pd.read_sql(
+                f"""SELECT c.name as category, SUM(e.amount) as amount 
+                FROM expenses e JOIN categories c ON e.category_id = c.id 
+                WHERE e.user_id = {user_id} AND strftime('%Y-%m', e.date) = '{prev_month}'
+                GROUP BY c.name""",
+                conn
+            )
+
+            tips = []
+
+            if not df_current.empty and not df_prev.empty:
+                # Compare categories
+                merged = pd.merge(df_current, df_prev, on='category', how='outer', suffixes=('_current', '_prev'))
+                merged = merged.fillna(0)
+
+                for _, row in merged.iterrows():
+                    if row['amount_prev'] > 0 and row['amount_current'] > 0:
+                        change = (row['amount_current'] - row['amount_prev']) / row['amount_prev'] * 100
+                        if abs(change) > 20:
+                            direction = "more" if change > 0 else "less"
+                            tips.append(
+                                f"You're spending {abs(change):.0f}% {direction} on {row['category']} "
+                                f"this month (${row['amount_current']:.2f} vs ${row['amount_prev']:.2f} last month)."
+                            )
+
+            return tips if tips else ["Your spending patterns look normal. Keep it up!"]
+
+        except Exception as e:
+            print(f"Tips error: {e}")
+            return ["We couldn't generate tips right now. Please try again later."]
+        finally:
+            conn.close()
+
+    def process_receipt_image(self, image_path):
+        """Extract text from receipt image using OCR"""
+        try:
+            text = pytesseract.image_to_string(Image.open(image_path))
+
+            # Extract amount
+            amounts = re.findall(r'\$\d+\.\d{2}', text)
+            amount = float(amounts[-1][1:]) if amounts else None
+
+            # Extract date (simple pattern matching)
+            dates = re.findall(r'\d{2}/\d{2}/\d{4}', text)
+            date = dates[0] if dates else datetime.now().strftime('%Y-%m-%d')
+
+            # Extract vendor/store name (first line usually)
+            vendor = text.split('\n')[0] if text else "Unknown Vendor"
+
+            return {
+                'amount': amount,
+                'date': date,
+                'vendor': vendor,
+                'raw_text': text
+            }
+        except Exception as e:
+            print(f"OCR error: {e}")
+            return None
+
+    def chat_with_ai(self, message, user_id):
+        """Handle natural language queries with GPT"""
+        try:
+            # First try to handle common queries locally
+            lower_msg = message.lower()
+
+            if "how much did i spend on" in lower_msg:
+                category = lower_msg.split("on")[-1].strip()
+                return self._get_category_spending(user_id, category)
+
+            elif "show me my spending last month" in lower_msg:
+                return self._get_monthly_summary(user_id)
+
+            elif "add expense" in lower_msg:
+                return "Please use the 'Add Expense' form to record new expenses."
+
+            # For more complex queries, use OpenAI
+            context = self._get_user_financial_context(user_id)
+
+            response = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system",
+                     "content": f"You are a helpful financial assistant. Here's the user's financial context: {context}"},
+                    {"role": "user", "content": message}
+                ],
+                temperature=0.7
+            )
+
+            return response.choices[0].message['content']
+
+        except Exception as e:
+            print(f"Chat error: {e}")
+            return "I'm having trouble answering that right now. Please try again later."
+
+    def _get_category_spending(self, user_id, category):
+        """Get spending for a specific category"""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                """SELECT SUM(e.amount) 
+                FROM expenses e JOIN categories c ON e.category_id = c.id 
+                WHERE e.user_id = ? AND c.name LIKE ?""",
+                (user_id, f"%{category}%")
+            )
+            amount = cursor.fetchone()[0] or 0
+            return f"You've spent ${amount:.2f} on {category}."
+        except:
+            return f"Could not retrieve spending data for {category}."
+        finally:
+            conn.close()
+
+    def _get_monthly_summary(self, user_id):
+        """Get last month's spending summary"""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            last_month = (datetime.now() - timedelta(days=30)).strftime('%Y-%m')
+            cursor = conn.cursor()
+            cursor.execute(
+                """SELECT c.name, SUM(e.amount) 
+                FROM expenses e JOIN categories c ON e.category_id = c.id 
+                WHERE e.user_id = ? AND strftime('%Y-%m', e.date) = ?
+                GROUP BY c.name""",
+                (user_id, last_month)
+            )
+            results = cursor.fetchall()
+
+            if not results:
+                return "No expenses found for last month."
+
+            summary = "Last month's spending:\n"
+            for category, amount in results:
+                summary += f"{category}: ${amount:.2f}\n"
+
+            total = sum(amount for _, amount in results)
+            summary += f"\nTotal: ${total:.2f}"
+
+            return summary
+        except:
+            return "Could not retrieve last month's spending data."
+        finally:
+            conn.close()
+
+    def _get_user_financial_context(self, user_id):
+        """Get financial context for GPT responses"""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            # Get categories and spending
+            cursor = conn.cursor()
+            cursor.execute(
+                """SELECT c.name, SUM(e.amount) 
+                FROM expenses e JOIN categories c ON e.category_id = c.id 
+                WHERE e.user_id = ?
+                GROUP BY c.name""",
+                (user_id,)
+            )
+            categories = cursor.fetchall()
+
+            # Get monthly trends
+            cursor.execute(
+                """SELECT strftime('%Y-%m', date) as month, SUM(amount) 
+                FROM expenses 
+                WHERE user_id = ? 
+                GROUP BY month 
+                ORDER BY month DESC 
+                LIMIT 6""",
+                (user_id,)
+            )
+            monthly = cursor.fetchall()
+
+            context = "User's financial information:\n"
+            context += "Spending by category:\n"
+            for cat, amount in categories:
+                context += f"- {cat}: ${amount:.2f}\n"
+
+            context += "\nMonthly spending:\n"
+            for month, amount in monthly:
+                context += f"- {month}: ${amount:.2f}\n"
+
+            return context
+        except:
+            return "Limited financial context available."
+        finally:
+            conn.close()
+
+These arethe html codes
+*templates>ai>htmlfiles
+
+1.anomales.html
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container mt-4">
+    <h2>Spending Anomalies</h2>
+
+    {% if not anomalies %}
+        <div class="alert alert-info mt-4">No unusual spending patterns detected.</div>
+    {% else %}
+        <div class="table-responsive mt-4">
+            <table class="table table-striped">
+                <thead>
+                    <tr>
+                        <th>Date</th>
+                        <th>Amount</th>
+                        <th>Reason</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for anomaly in anomalies %}
+                    <tr>
+                        <td>{{ anomaly.date }}</td>
+                        <td>${{ anomaly.amount }}</td>
+                        <td>{{ anomaly.reason }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    {% endif %}
+</div>
+{% endblock %}
+
+2. budget_recommendations.html
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container mt-4">
+    <h2>Budget Recommendations</h2>
+
+    {% if not recommendations %}
+        <div class="alert alert-info mt-4">Not enough data to generate recommendations. Start tracking expenses first.</div>
+    {% else %}
+        <div class="table-responsive mt-4">
+            <table class="table table-striped">
+                <thead>
+                    <tr>
+                        <th>Category</th>
+                        <th>Current Avg</th>
+                        <th>Recommended</th>
+                        <th>Advice</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for rec in recommendations %}
+                    <tr>
+                        <td>{{ rec.category }}</td>
+                        <td>${{ rec.current_avg }}</td>
+                        <td>${{ rec.recommended }}</td>
+                        <td>{{ rec.advice }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+
+        <div class="card mt-4">
+            <div class="card-body">
+                <h5>How to use these recommendations:</h5>
+                <ul>
+                    <li>Set monthly budgets based on the recommended amounts</li>
+                    <li>Track your progress in the analytics section</li>
+                    <li>Adjust as needed based on your financial goals</li>
+                </ul>
+            </div>
+        </div>
+    {% endif %}
+</div>
+{% endblock %}
+
+3.chat.html
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container mt-4">
+    <div class="row">
+        <div class="col-md-8 offset-md-2">
+            <div class="card">
+                <div class="card-header bg-primary text-white">
+                    <h4><i class="bi bi-robot"></i> AI Financial Assistant</h4>
+                </div>
+                <div class="card-body">
+                    <div id="chat-container" style="height: 400px; overflow-y: scroll; margin-bottom: 20px; border: 1px solid #ddd; padding: 10px; border-radius: 5px; background-color: #f8f9fa;">
+                        <!-- Chat messages will appear here -->
+                    </div>
+
+                    <div class="input-group mb-3">
+                        <input type="text" id="message-input" class="form-control" placeholder="Ask me about your expenses..." aria-label="Chat input">
+                        <button class="btn btn-outline-secondary" type="button" id="voice-btn">
+                            <i class="bi bi-mic"></i>
+                        </button>
+                        <button class="btn btn-primary" type="button" id="send-btn">
+                            <i class="bi bi-send"></i> Send
+                        </button>
+                    </div>
+
+                    <div class="text-muted small">
+                        <p class="mb-1"><strong>Try asking:</strong></p>
+                        <ul class="list-unstyled">
+                            <li><i class="bi bi-chevron-right"></i> "How much did I spend on food last month?"</li>
+                            <li><i class="bi bi-chevron-right"></i> "What's my total spending this month?"</li>
+                            <li><i class="bi bi-chevron-right"></i> "Show me my spending categories"</li>
+                            <li><i class="bi bi-chevron-right"></i> "Add an expense for $25 at Starbucks"</li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<audio id="response-audio" controls style="display: none;"></audio>
+
+{% block extra_js %}
+<script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+<script>
+$(document).ready(function() {
+    const chatContainer = $('#chat-container');
+    const messageInput = $('#message-input');
+    const sendBtn = $('#send-btn');
+    const voiceBtn = $('#voice-btn');
+    const responseAudio = $('#response-audio')[0];
+
+    function addMessage(sender, message, isHtml = false) {
+        const messageDiv = $(`
+            <div class="mb-3 ${sender === 'You' ? 'text-end' : 'text-start'}">
+                <div class="d-inline-block p-3 rounded-3 ${sender === 'You' ? 'bg-primary text-white' : 'bg-light'}">
+                    <strong>${sender}:</strong> ${isHtml ? message : $('<div>').text(message).html()}
+                </div>
+            </div>
+        `);
+        chatContainer.append(messageDiv);
+        chatContainer.scrollTop(chatContainer[0].scrollHeight);
+    }
+
+    // Initial greeting
+    addMessage('Assistant', "Hello! I'm your financial assistant. You can ask me about your expenses, get reports, or even add new expenses. How can I help you today?");
+
+    function sendMessage() {
+        const message = messageInput.val().trim();
+        if (!message) return;
+
+        addMessage('You', message);
+        messageInput.val('');
+
+        // Show loading indicator
+        const loadingDiv = $(`
+            <div class="text-center mb-3">
+                <div class="spinner-border spinner-border-sm text-secondary" role="status">
+                    <span class="visually-hidden">Loading...</span>
+                </div>
+            </div>
+        `);
+        chatContainer.append(loadingDiv);
+        chatContainer.scrollTop(chatContainer[0].scrollHeight);
+
+        $.post('/chat', {message: message})
+            .done(function(data) {
+                loadingDiv.remove();
+                if (data.redirect) {
+                    addMessage('Assistant', data.response);
+                    setTimeout(() => {
+                        window.location.href = data.redirect;
+                    }, 1000);
+                } else if (data.action === 'confirm_delete') {
+                    addMessage('Assistant', data.response);
+                    const confirmDiv = $(`
+                        <div class="mb-3">
+                            <button class="btn btn-danger btn-sm confirm-delete" data-id="${data.expense_id}">Yes, delete</button>
+                            <button class="btn btn-secondary btn-sm cancel-delete">Cancel</button>
+                        </div>
+                    `);
+                    chatContainer.append(confirmDiv);
+
+                    $('.confirm-delete').click(function() {
+                        const expenseId = $(this).data('id');
+                        $.post('/expenses/delete/' + expenseId, function() {
+                            addMessage('Assistant', 'Expense deleted successfully.');
+                        });
+                    });
+
+                    $('.cancel-delete').click(function() {
+                        addMessage('Assistant', 'Delete canceled.');
+                    });
+                } else {
+                    addMessage('Assistant', data.response);
+                }
+            })
+            .fail(function() {
+                loadingDiv.remove();
+                addMessage('Assistant', "I'm having trouble responding right now. Please try again later.");
+            });
+    }
+
+    sendBtn.click(sendMessage);
+
+    messageInput.keypress(function(e) {
+        if (e.which === 13) {  // Enter key
+            sendMessage();
+        }
+    });
+
+    let recorder;
+    let audioChunks = [];
+
+    voiceBtn.mousedown(async function() {
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({audio: true});
+            recorder = new MediaRecorder(stream);
+            audioChunks = [];
+
+            recorder.ondataavailable = e => {
+                audioChunks.push(e.data);
+            };
+
+            recorder.start();
+            voiceBtn.html('<i class="bi bi-stop-circle"></i> Recording...');
+            voiceBtn.removeClass('btn-outline-secondary').addClass('btn-danger');
+        } catch (err) {
+            console.error('Error accessing microphone:', err);
+            addMessage('Assistant', 'Could not access microphone. Please check permissions.');
+        }
+    });
+
+    voiceBtn.mouseup(function() {
+        if (recorder && recorder.state !== 'inactive') {
+            recorder.stop();
+            recorder.stream.getTracks().forEach(track => track.stop());
+            voiceBtn.html('<i class="bi bi-mic"></i>');
+            voiceBtn.removeClass('btn-danger').addClass('btn-outline-secondary');
+
+            recorder.onstop = async () => {
+                const audioBlob = new Blob(audioChunks, {type: 'audio/wav'});
+                const formData = new FormData();
+                formData.append('audio', audioBlob, 'command.wav');
+
+                try {
+                    const response = await fetch('/voice_command', {
+                        method: 'POST',
+                        body: formData
+                    });
+
+                    const data = await response.json();
+
+                    if (data.error) {
+                        addMessage('Assistant', data.error);
+                    } else {
+                        addMessage('You', data.text);
+                        addMessage('Assistant', data.response);
+
+                        if (data.audio_url) {
+                            responseAudio.src = data.audio_url;
+                            responseAudio.play();
+                        }
+                    }
+                } catch (err) {
+                    console.error('Error sending voice command:', err);
+                    addMessage('Assistant', 'Error processing voice command.');
+                }
+            };
+        }
+    });
+});
+</script>
+{% endblock %}
+{% endblock %}
+
+4.predictions.html
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container mt-4">
+    <h2>Expense Predictions</h2>
+
+    {% if predictions is string %}
+        <div class="alert alert-info">{{ predictions }}</div>
+    {% else %}
+        <div class="card-deck mt-4">
+            <div class="card">
+                <div class="card-body">
+                    <h5 class="card-title">Daily</h5>
+                    <p class="card-text">${{ predictions.predicted_daily }}</p>
+                </div>
+            </div>
+            <div class="card">
+                <div class="card-body">
+                    <h5 class="card-title">Weekly</h5>
+                    <p class="card-text">${{ predictions.predicted_weekly }}</p>
+                </div>
+            </div>
+            <div class="card">
+                <div class="card-body">
+                    <h5 class="card-title">Monthly</h5>
+                    <p class="card-text">${{ predictions.predicted_monthly }}</p>
+                </div>
+            </div>
+        </div>
+
+        <div class="mt-4">
+            <p>These predictions are based on your spending patterns over the last 30 days.</p>
+        </div>
+    {% endif %}
+</div>
+{% endblock %}
+
+5.receipt_result.html
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container mt-4">
+    <h2>Receipt Details</h2>
+
+    <div class="card mt-4">
+        <div class="card-body">
+            <h4>Extracted Information</h4>
+
+            <div class="row mt-3">
+                <div class="col-md-6">
+                    <p><strong>Merchant:</strong> {{ receipt_data.merchant }}</p>
+                    <p><strong>Date:</strong> {{ receipt_data.date }}</p>
+                    <p><strong>Total:</strong> ${{ receipt_data.total }}</p>
+                </div>
+                <div class="col-md-6">
+                    <h5>Items:</h5>
+                    <ul>
+                        {% for item in receipt_data.items %}
+                        <li>{{ item }}</li>
+                        {% endfor %}
+                    </ul>
+                </div>
+            </div>
+
+            <form method="POST" action="{{ url_for('add_expense') }}">
+                <input type="hidden" name="title" value="{{ receipt_data.merchant }}">
+                <input type="hidden" name="amount" value="{{ receipt_data.total }}">
+                <input type="hidden" name="date" value="{{ receipt_data.date }}">
+
+                <div class="form-group">
+                    <label for="category">Category</label>
+                    <select class="form-control" id="category" name="category">
+                        {% for category in categories %}
+                        <option>{{ category }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+
+                <div class="form-group">
+                    <label for="notes">Notes</label>
+                    <textarea class="form-control" id="notes" name="notes" rows="2"></textarea>
+                </div>
+
+                <button type="submit" class="btn btn-primary">Add as Expense</button>
+            </form>
+        </div>
+    </div>
+
+    <div class="card mt-4">
+        <div class="card-body">
+            <h4>OCR Text</h4>
+            <pre style="max-height: 200px; overflow-y: scroll;">{{ ocr_text }}</pre>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+6.receipt_upload.html
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container mt-4">
+    <h2>Scan Receipt</h2>
+
+    <div class="card mt-4">
+        <div class="card-body">
+            <form method="POST" enctype="multipart/form-data">
+                <div class="form-group">
+                    <label for="file">Upload Receipt Image</label>
+                    <input type="file" class="form-control-file" id="file" name="file" accept="image/*">
+                </div>
+                <button type="submit" class="btn btn-primary">Upload</button>
+            </form>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+7.remainders.html
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container mt-4">
+    <h2>Your Reminders</h2>
+
+    <div class="card mt-4">
+        <div class="card-body">
+            <h4>Add New Reminder</h4>
+            <form method="POST" action="{{ url_for('add_reminder') }}">
+                <div class="form-group">
+                    <label for="description">Description</label>
+                    <input type="text" class="form-control" id="description" name="description" required>
+                </div>
+                <div class="form-group">
+                    <label for="due_date">Due Date</label>
+                    <input type="date" class="form-control" id="due_date" name="due_date" required>
+                </div>
+                <div class="form-group">
+                    <label for="recurring">Recurring</label>
+                    <select class="form-control" id="recurring" name="recurring">
+                        <option value="none">None</option>
+                        <option value="daily">Daily</option>
+                        <option value="weekly">Weekly</option>
+                        <option value="monthly">Monthly</option>
+                        <option value="yearly">Yearly</option>
+                    </select>
+                </div>
+                <button type="submit" class="btn btn-primary">Add Reminder</button>
+            </form>
+        </div>
+    </div>
+
+    <div class="card mt-4">
+        <div class="card-body">
+            <h4>Upcoming Reminders</h4>
+
+            {% if not reminders %}
+                <div class="alert alert-info mt-2">No upcoming reminders.</div>
+            {% else %}
+                <ul class="list-group mt-2">
+                    {% for reminder in reminders %}
+                    <li class="list-group-item">
+                        <div class="d-flex justify-content-between align-items-center">
+                            <div>
+                                <h5>{{ reminder.description }}</h5>
+                                <small>Due: {{ reminder.due_date }}</small>
+                            </div>
+                            <div>
+                                <form method="POST" action="{{ url_for('complete_reminder', id=reminder.id) }}" style="display: inline;">
+                                    <button type="submit" class="btn btn-success btn-sm">Complete</button>
+                                </form>
+                            </div>
+                        </div>
+                    </li>
+                    {% endfor %}
+                </ul>
+            {% endif %}
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+8.tips.html
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container mt-4">
+    <h2>Personalized Financial Tips</h2>
+
+    <div class="card mt-4">
+        <div class="card-body">
+            <ol>
+                {% for tip in tips %}
+                <li class="mb-2">{{ tip }}</li>
+                {% endfor %}
+            </ol>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+*templates>auth>htmlfiles
+1.login.html
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Login</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body class="container mt-5">
+    <div class="row justify-content-center">
+        <div class="col-md-6">
+            <div class="card">
+                <div class="card-header">
+                    <h2 class="text-center">Login</h2>
+                </div>
+                <div class="card-body">
+                    {% with messages = get_flashed_messages(with_categories=true) %}
+                        {% if messages %}
+                            {% for category, message in messages %}
+                                <div class="alert alert-{{ category }}">{{ message }}</div>
+                            {% endfor %}
+                        {% endif %}
+                    {% endwith %}
+
+                    <form method="post">
+                        <div class="mb-3">
+                            <label for="username" class="form-label">Username</label>
+                            <input type="text" class="form-control" id="username" name="username" required>
+                        </div>
+                        <div class="mb-3">
+                            <label for="password" class="form-label">Password</label>
+                            <input type="password" class="form-control" id="password" name="password" required>
+                        </div>
+                        <div class="d-grid">
+                            <button type="submit" class="btn btn-primary">Login</button>
+                        </div>
+                    </form>
+
+                    <div class="mt-3 text-center">
+                        <p>Don't have an account? <a href="{{ url_for('register') }}">Register here</a></p>
+                        <p><a href="{{ url_for('reset_request') }}">Forgot password?</a></p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
+
+2.registers.html
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Register</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body class="container mt-5">
+    <div class="row justify-content-center">
+        <div class="col-md-6">
+            <div class="card">
+                <div class="card-header">
+                    <h2 class="text-center">Register</h2>
+                </div>
+                <div class="card-body">
+                    {% with messages = get_flashed_messages(with_categories=true) %}
+                        {% if messages %}
+                            {% for category, message in messages %}
+                                <div class="alert alert-{{ category }}">{{ message }}</div>
+                            {% endfor %}
+                        {% endif %}
+                    {% endwith %}
+
+                    <form method="post">
+                        <div class="mb-3">
+                            <label for="username" class="form-label">Username</label>
+                            <input type="text" class="form-control" id="username" name="username" required>
+                        </div>
+                        <div class="mb-3">
+                            <label for="email" class="form-label">Email</label>
+                            <input type="email" class="form-control" id="email" name="email" required>
+                        </div>
+                        <div class="mb-3">
+                            <label for="password" class="form-label">Password</label>
+                            <input type="password" class="form-control" id="password" name="password" required>
+                        </div>
+                        <div class="mb-3">
+                            <label for="confirm_password" class="form-label">Confirm Password</label>
+                            <input type="password" class="form-control" id="confirm_password" name="confirm_password" required>
+                        </div>
+                        <div class="d-grid">
+                            <button type="submit" class="btn btn-primary">Register</button>
+                        </div>
+                    </form>
+
+                    <div class="mt-3 text-center">
+                        <p>Already have an account? <a href="{{ url_for('login') }}">Login here</a></p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
+
+3.reset_password.html
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Set New Password</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body class="container mt-5">
+    <div class="row justify-content-center">
+        <div class="col-md-6">
+            <div class="card">
+                <div class="card-header">
+                    <h2 class="text-center">Set New Password</h2>
+                </div>
+                <div class="card-body">
+                    {% with messages = get_flashed_messages(with_categories=true) %}
+                        {% if messages %}
+                            {% for category, message in messages %}
+                                <div class="alert alert-{{ category }}">{{ message }}</div>
+                            {% endfor %}
+                        {% endif %}
+                    {% endwith %}
+
+                    <form method="post">
+                        <div class="mb-3">
+                            <label for="password" class="form-label">New Password</label>
+                            <input type="password" class="form-control" id="password" name="password" required>
+                        </div>
+                        <div class="mb-3">
+                            <label for="confirm_password" class="form-label">Confirm New Password</label>
+                            <input type="password" class="form-control" id="confirm_password" name="confirm_password" required>
+                        </div>
+                        <input type="hidden" name="token" value="{{ token }}">
+                        <div class="d-grid">
+                            <button type="submit" class="btn btn-primary">Update Password</button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
+
+4.reset_request.html
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Reset Password</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body class="container mt-5">
+    <div class="row justify-content-center">
+        <div class="col-md-6">
+            <div class="card">
+                <div class="card-header">
+                    <h2 class="text-center">Reset Password</h2>
+                </div>
+                <div class="card-body">
+                    {% with messages = get_flashed_messages(with_categories=true) %}
+                        {% if messages %}
+                            {% for category, message in messages %}
+                                <div class="alert alert-{{ category }}">{{ message }}</div>
+                            {% endfor %}
+                        {% endif %}
+                    {% endwith %}
+
+                    <form method="post">
+                        <div class="mb-3">
+                            <label for="email" class="form-label">Email Address</label>
+                            <input type="email" class="form-control" id="email" name="email" required>
+                        </div>
+                        <div class="d-grid">
+                            <button type="submit" class="btn btn-primary">Request Reset Link</button>
+                        </div>
+                    </form>
+
+                    <div class="mt-3 text-center">
+                        <a href="{{ url_for('login') }}">Back to Login</a>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
+
+*templates>categories>html files
+1.add_category.html
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Add Category</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body class="container mt-4">
+    <nav class="navbar navbar-expand-lg navbar-light bg-light mb-4">
+        <div class="container-fluid">
+            <a class="navbar-brand" href="/">Expense Tracker</a>
+            <div class="navbar-nav">
+                <a class="nav-link" href="/dashboard">Dashboard</a>
+                <a class="nav-link" href="/expenses">Expenses</a>
+                <a class="nav-link active" href="/categories">Categories</a>
+                <a class="nav-link" href="/reports">Reports</a>
+                <a class="nav-link" href="/settings">Settings</a>
+                <a class="nav-link" href="/logout">Logout</a>
+            </div>
+        </div>
+    </nav>
+
+    <h1 class="mb-4">Add New Category</h1>
+
+    <form method="post" class="col-md-6">
+        <div class="mb-3">
+            <label for="name" class="form-label">Category Name</label>
+            <input type="text" class="form-control" id="name" name="name" required>
+            <div class="form-text">This will appear in your category dropdown when adding expenses</div>
+        </div>
+
+        <button type="submit" class="btn btn-primary">Add Category</button>
+        <a href="/categories" class="btn btn-secondary">Cancel</a>
+    </form>
+</body>
+</html>
+
+2.category_expense.html
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container mt-4">
+    <h1 class="mb-4">Expenses for Category: {{ category_name }}</h1>
+
+    <div class="mb-3">
+        <a href="{{ url_for('manage_categories') }}" class="btn btn-secondary">Back to Categories</a>
+    </div>
+
+    <div class="table-responsive">
+        <table class="table table-striped">
+            <thead class="table-dark">
+                <tr>
+                    <th>Title</th>
+                    <th>Amount</th>
+                    <th>Date</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for expense in expenses %}
+                <tr>
+                    <td>{{ expense[1] }}</td>
+                    <td>${{ "%.2f"|format(expense[2]) }}</td>
+                    <td>{{ expense[3] }}</td>
+                    <td>
+                        <a href="{{ url_for('edit_expense', id=expense[0]) }}" class="btn btn-sm btn-warning">Edit</a>
+                        <a href="{{ url_for('delete_expense', id=expense[0]) }}" class="btn btn-sm btn-danger" onclick="return confirm('Are you sure?')">Delete</a>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endblock %}
+
+3.manage_categories.html
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Manage Categories</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body class="container mt-4">
+    <nav class="navbar navbar-expand-lg navbar-light bg-light mb-4">
+        <div class="container-fluid">
+            <a class="navbar-brand" href="/">Expense Tracker</a>
+            <div class="navbar-nav">
+                <a class="nav-link" href="/dashboard">Dashboard</a>
+                <a class="nav-link" href="/expenses">Expenses</a>
+                <a class="nav-link active" href="/categories">Categories</a>
+                <a class="nav-link" href="/reports">Reports</a>
+                <a class="nav-link" href="/settings">Settings</a>
+                <a class="nav-link" href="/logout">Logout</a>
+            </div>
+        </div>
+    </nav>
+
+    <h1 class="mb-4">Manage Categories</h1>
+
+    <div class="mb-3">
+        <a href="/categories/add" class="btn btn-success">Add New Category</a>
+    </div>
+
+    <div class="table-responsive">
+        <table class="table table-striped">
+            <thead class="table-dark">
+                <tr>
+                    <th>Category Name</th>
+                    <th>Type</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for cat in categories %}
+                <tr>
+                    <td>{{ cat[1] }}</td>
+                    <td>
+                        {% if cat[2] %}
+                            <span class="badge bg-primary">Default</span>
+                        {% else %}
+                            <span class="badge bg-success">Custom</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        <a href="/categories/{{ cat[0] }}" class="btn btn-sm btn-info">View</a>
+                        {% if not cat[2] %}
+                            <a href="/categories/delete/{{ cat[0] }}" class="btn btn-sm btn-danger" onclick="return confirm('Are you sure?')">Delete</a>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</body>
+</html>
+
+*templates>expense>html file
+1.add.html
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Add Expense</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body class="container mt-4">
+    <h1 class="mb-4">Add Expense</h1>
+
+    <form method="post" class="col-md-6">
+        <div class="mb-3">
+            <label for="title" class="form-label">Title</label>
+            <input type="text" class="form-control" id="title" name="title" required>
+        </div>
+
+        <div class="mb-3">
+            <label for="amount" class="form-label">Amount</label>
+            <input type="number" class="form-control" id="amount" name="amount" step="0.01" required>
+        </div>
+
+        <div class="mb-3">
+            <label for="category" class="form-label">Category</label>
+            <select class="form-select" id="category" name="category" required>
+                <option value="">Select a category</option>
+                {% for cat in categories %}
+                <option value="{{ cat }}">{{ cat }}</option>
+                {% endfor %}
+            </select>
+            <small class="text-muted">Or <a href="/categories/add">add a new category</a></small>
+        </div>
+
+        <div class="mb-3">
+            <label for="date" class="form-label">Date</label>
+            <input type="date" class="form-control" id="date" name="date" value="{{ today }}" required>
+        </div>
+
+        <div class="mb-3">
+            <label for="notes" class="form-label">Notes (Optional)</label>
+            <textarea class="form-control" id="notes" name="notes" rows="3"></textarea>
+        </div>
+
+        <button type="submit" class="btn btn-primary">Add Expense</button>
+        <a href="/expenses" class="btn btn-secondary">Cancel</a>
+    </form>
+</body>
+</html>
+
+2.edit.html
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Edit Expense</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body class="container mt-4">
+    <h1 class="mb-4">Edit Expense</h1>
+
+    <form method="post" class="col-md-6">
+        <div class="mb-3">
+            <label for="title" class="form-label">Title</label>
+            <input type="text" class="form-control" id="title" name="title" value="{{ expense[1] }}" required>
+        </div>
+
+        <div class="mb-3">
+            <label for="amount" class="form-label">Amount</label>
+            <input type="number" class="form-control" id="amount" name="amount" value="{{ expense[2] }}" step="0.01" required>
+        </div>
+
+        <div class="mb-3">
+            <label for="category" class="form-label">Category</label>
+            <select class="form-select" id="category" name="category" required>
+                <option value="">Select a category</option>
+                {% for cat in categories %}
+                <option value="{{ cat }}" {% if cat == expense[3] %}selected{% endif %}>{{ cat }}</option>
+                {% endfor %}
+            </select>
+        </div>
+
+        <div class="mb-3">
+            <label for="date" class="form-label">Date</label>
+            <input type="date" class="form-control" id="date" name="date" value="{{ expense[4] }}" required>
+        </div>
+
+        <div class="mb-3">
+            <label for="notes" class="form-label">Notes</label>
+            <textarea class="form-control" id="notes" name="notes" rows="3">{{ expense[5] if expense[5] else '' }}</textarea>
+        </div>
+
+        <button type="submit" class="btn btn-primary">Update Expense</button>
+        <a href="/expenses" class="btn btn-secondary">Cancel</a>
+    </form>
+</body>
+</html>
+
+3.index.html
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Expenses</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body class="container mt-4">
+    <nav class="navbar navbar-expand-lg navbar-light bg-light mb-4">
+        <div class="container-fluid">
+            <a class="navbar-brand" href="/">Expense Tracker</a>
+            <div class="navbar-nav">
+                <a class="nav-link" href="/dashboard">Dashboard</a>
+                <a class="nav-link" href="/categories">Categories</a>
+                <a class="nav-link" href="/reports">Reports</a>
+                <a class="nav-link" href="/settings">Settings</a>
+                <a class="nav-link" href="/logout">Logout</a>
+            </div>
+        </div>
+    </nav>
+
+    <h1 class="mb-4">Expense List</h1>
+
+    <div class="card mb-4">
+        <div class="card-body">
+            <form method="get" class="row g-3">
+                <div class="col-md-3">
+                    <label class="form-label">Category</label>
+                    <select name="category" class="form-select">
+                        <option value="">All Categories</option>
+                        {% for cat in categories %}
+                        <option value="{{ cat }}" {% if cat == request.args.get('category') %}selected{% endif %}>{{ cat }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label">From Date</label>
+                    <input type="date" name="date_from" class="form-control" value="{{ request.args.get('date_from') }}">
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label">To Date</label>
+                    <input type="date" name="date_to" class="form-control" value="{{ request.args.get('date_to') }}">
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label">Search</label>
+                    <input type="text" name="search" class="form-control" value="{{ request.args.get('search') }}" placeholder="Search expenses">
+                </div>
+                <div class="col-12">
+                    <button type="submit" class="btn btn-primary">Filter</button>
+                    <a href="/expenses" class="btn btn-secondary">Reset</a>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <div class="mb-3">
+        <a href="/expenses/add" class="btn btn-success">Add Expense</a>
+    </div>
+
+    <div class="table-responsive">
+        <table class="table table-striped table-hover">
+            <thead class="table-dark">
+                <tr>
+                    <th>Title</th>
+                    <th>Amount</th>
+                    <th>Category</th>
+                    <th>Date</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for e in expenses %}
+                <tr>
+                    <td>{{ e[1] }}</td>
+                    <td>${{ "%.2f"|format(e[2]) }}</td>
+                    <td>{{ e[3] }}</td>
+                    <td>{{ e[4] }}</td>
+                    <td>
+                        <a href="/expenses/edit/{{ e[0] }}" class="btn btn-sm btn-warning">Edit</a>
+                        <a href="/expenses/delete/{{ e[0] }}" class="btn btn-sm btn-danger" onclick="return confirm('Are you sure?')">Delete</a>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</body>
+</html>
+
+*templates>reports>html files
+1.analytics.html
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container mt-4">
+    <h1 class="mb-4">Expense Analytics</h1>
+
+    <div class="row mb-4">
+        <div class="col-md-6">
+            <div class="card">
+                <div class="card-header">
+                    <h5>Category Distribution</h5>
+                </div>
+                <div class="card-body">
+                    <canvas id="pieChart"></canvas>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-6">
+            <div class="card">
+                <div class="card-header">
+                    <h5>Monthly Trends</h5>
+                </div>
+                <div class="card-body">
+                    <canvas id="lineChart"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="row">
+        <div class="col-md-12">
+            <div class="card">
+                <div class="card-header">
+                    <h5>Weekly Trends (Last 12 Weeks)</h5>
+                </div>
+                <div class="card-body">
+                    <canvas id="weeklyChart"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script>
+    // Pie Chart
+    new Chart(
+        document.getElementById('pieChart'),
+        {
+            type: 'pie',
+            data: {
+                labels: {{ pie_labels|safe }},
+                datasets: [{
+                    data: {{ pie_values|safe }},
+                    backgroundColor: [
+                        '#FF6384', '#36A2EB', '#FFCE56', '#4BC0C0',
+                        '#9966FF', '#FF9F40', '#8AC24A', '#607D8B'
+                    ]
+                }]
+            }
+        }
+    );
+
+    // Line Chart
+    new Chart(
+        document.getElementById('lineChart'),
+        {
+            type: 'line',
+            data: {
+                labels: {{ line_labels|safe }},
+                datasets: [{
+                    label: 'Monthly Expenses',
+                    data: {{ line_values|safe }},
+                    borderColor: '#36A2EB',
+                    tension: 0.1
+                }]
+            },
+            options: {
+                scales: {
+                    y: {
+                        beginAtZero: true
+                    }
+                }
+            }
+        }
+    );
+
+    // Weekly Chart
+    new Chart(
+        document.getElementById('weeklyChart'),
+        {
+            type: 'bar',
+            data: {
+                labels: {{ weekly_labels|safe }},
+                datasets: [{
+                    label: 'Weekly Expenses',
+                    data: {{ weekly_values|safe }},
+                    backgroundColor: '#4BC0C0'
+                }]
+            },
+            options: {
+                scales: {
+                    y: {
+                        beginAtZero: true
+                    }
+                }
+            }
+        }
+    );
+</script>
+{% endblock %}
+
+2.reports.html
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Reports</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body class="container mt-4">
+    <nav class="navbar navbar-expand-lg navbar-light bg-light mb-4">
+        <div class="container-fluid">
+            <a class="navbar-brand" href="/">Expense Tracker</a>
+            <div class="navbar-nav">
+                <a class="nav-link" href="/dashboard">Dashboard</a>
+                <a class="nav-link" href="/expenses">Expenses</a>
+                <a class="nav-link" href="/categories">Categories</a>
+                <a class="nav-link active" href="/reports">Reports</a>
+                <a class="nav-link" href="/settings">Settings</a>
+                <a class="nav-link" href="/logout">Logout</a>
+            </div>
+        </div>
+    </nav>
+
+    <h1 class="mb-4">Reports</h1>
+
+    <div class="row mb-4">
+        <div class="col-md-6">
+            <div class="card">
+                <div class="card-header">
+                    <h5>Monthly Summary</h5>
+                </div>
+                <div class="card-body">
+                    <table class="table">
+                        <thead>
+                            <tr>
+                                <th>Month</th>
+                                <th>Total</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for month in monthly_summary %}
+                            <tr>
+                                <td>{{ month[0] }}</td>
+                                <td>${{ "%.2f"|format(month[1]) }}</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-6">
+            <div class="card">
+                <div class="card-header">
+                    <h5>Yearly Summary</h5>
+                </div>
+                <div class="card-body">
+                    <table class="table">
+                        <thead>
+                            <tr>
+                                <th>Year</th>
+                                <th>Total</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for year in yearly_summary %}
+                            <tr>
+                                <td>{{ year[0] }}</td>
+                                <td>${{ "%.2f"|format(year[1]) }}</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="text-center">
+        <a href="/analytics" class="btn btn-primary">View Detailed Analytics</a>
+    </div>
+</body>
+</html>
+*template >html files
+1.base.html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Expense Tracker{% endblock %}</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css">
+    <style>
+        body {
+            padding-top: 20px;
+            background-color: #f8f9fa;
+        }
+        .navbar {
+            margin-bottom: 20px;
+        }
+        .card {
+            margin-bottom: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,.1);
+        }
+        .table-responsive {
+            margin-bottom: 20px;
+        }
+    </style>
+    {% block extra_css %}{% endblock %}
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-dark bg-primary">
+        <div class="container">
+            <a class="navbar-brand" href="{{ url_for('dashboard') }}">Expense Tracker</a>
+            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
+                <span class="navbar-toggler-icon"></span>
+            </button>
+            <div class="collapse navbar-collapse" id="navbarNav">
+                <ul class="navbar-nav me-auto">
+                    <li class="nav-item">
+                        <a class="nav-link" href="{{ url_for('dashboard') }}"><i class="bi bi-speedometer2"></i> Dashboard</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="{{ url_for('expenses') }}"><i class="bi bi-cash-stack"></i> Expenses</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="{{ url_for('manage_categories') }}"><i class="bi bi-tags"></i> Categories</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="{{ url_for('reports') }}"><i class="bi bi-graph-up"></i> Reports</a>
+                    </li>
+                    <li class="nav-item dropdown">
+                        <a class="nav-link dropdown-toggle" href="#" id="aiDropdown" role="button" data-bs-toggle="dropdown">
+                            <i class="bi bi-robot"></i> AI Features
+                        </a>
+                        <div class="dropdown-menu">
+                            <a class="dropdown-item" href="{{ url_for('chat') }}"><i class="bi bi-chat-left-text"></i> AI Assistant</a>
+                            <a class="dropdown-item" href="{{ url_for('show_predictions') }}"><i class="bi bi-graph-up-arrow"></i> Expense Predictions</a>
+                            <a class="dropdown-item" href="{{ url_for('show_anomalies') }}"><i class="bi bi-exclamation-triangle"></i> Anomaly Detection</a>
+                            <a class="dropdown-item" href="{{ url_for('show_tips') }}"><i class="bi bi-lightbulb"></i> Financial Tips</a>
+                            <a class="dropdown-item" href="{{ url_for('receipt_scan') }}"><i class="bi bi-receipt"></i> Receipt Scanner</a>
+                            <a class="dropdown-item" href="{{ url_for('show_budget_recommendations') }}"><i class="bi bi-piggy-bank"></i> Budget Recommendations</a>
+                            <a class="dropdown-item" href="{{ url_for('view_reminders') }}"><i class="bi bi-alarm"></i> Reminders</a>
+                        </div>
+                    </li>
+                </ul>
+                <ul class="navbar-nav">
+                    <li class="nav-item">
+                        <a class="nav-link" href="{{ url_for('settings') }}"><i class="bi bi-gear"></i> Settings</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="{{ url_for('logout') }}"><i class="bi bi-box-arrow-right"></i> Logout</a>
+                    </li>
+                </ul>
+            </div>
+        </div>
+    </nav>
+
+    <div class="container">
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                {% for category, message in messages %}
+                    <div class="alert alert-{{ category }} alert-dismissible fade show" role="alert">
+                        {{ message }}
+                        <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+                    </div>
+                {% endfor %}
+            {% endif %}
+        {% endwith %}
+
+        {% block content %}{% endblock %}
+    </div>
+
+    <footer class="mt-5 py-3 bg-light">
+        <div class="container text-center">
+            <span class="text-muted">Expense Tracker &copy; 2023</span>
+        </div>
+    </footer>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    {% block extra_js %}{% endblock %}
+</body>
+</html>
+
+2.dashboard.html
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Dashboard</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body class="container mt-4">
+    <nav class="navbar navbar-expand-lg navbar-light bg-light mb-4">
+        <div class="container-fluid">
+            <a class="navbar-brand" href="/">Expense Tracker</a>
+            <div class="navbar-nav">
+                <a class="nav-link active" href="/dashboard">Dashboard</a>
+                <a class="nav-link" href="/expenses">Expenses</a>
+                <a class="nav-link" href="/categories">Categories</a>
+                <a class="nav-link" href="/reports">Reports</a>
+                <a class="nav-link" href="/settings">Settings</a>
+                <a class="nav-link" href="/logout">Logout</a>
+            </div>
+        </div>
+    </nav>
+
+    <h1 class="mb-4">Dashboard</h1>
+
+    <div class="row mb-4">
+        <div class="col-md-4">
+            <div class="card text-white bg-primary">
+                <div class="card-body">
+                    <h5 class="card-title">Total Expenses</h5>
+                    <h2 class="card-text">${{ "%.2f"|format(total_expenses) }}</h2>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="row mb-4">
+        <div class="col-md-6">
+            <div class="card">
+                <div class="card-header">
+                    <h5>Recent Expenses</h5>
+                </div>
+                <div class="card-body">
+                    <table class="table">
+                        <thead>
+                            <tr>
+                                <th>Title</th>
+                                <th>Amount</th>
+                                <th>Date</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for e in recent_expenses %}
+                            <tr>
+                                <td>{{ e[1] }}</td>
+                                <td>${{ "%.2f"|format(e[2]) }}</td>
+                                <td>{{ e[4] }}</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-6">
+            <div class="card">
+                <div class="card-header">
+                    <h5>Category Distribution</h5>
+                </div>
+                <div class="card-body">
+                    <canvas id="pieChart"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="row">
+        <div class="col-md-12">
+            <div class="card">
+                <div class="card-header">
+                    <h5>Monthly Trends</h5>
+                </div>
+                <div class="card-body">
+                    <canvas id="lineChart"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Pie Chart
+        const pieCtx = document.getElementById('pieChart').getContext('2d');
+        const pieChart = new Chart(pieCtx, {
+            type: 'pie',
+            data: {
+                labels: {{ pie_labels|safe }},
+                datasets: [{
+                    data: {{ pie_values|safe }},
+                    backgroundColor: [
+                        '#FF6384', '#36A2EB', '#FFCE56', '#4BC0C0',
+                        '#9966FF', '#FF9F40', '#8AC24A', '#607D8B'
+                    ]
+                }]
+            }
+        });
+
+        // Line Chart
+        const lineCtx = document.getElementById('lineChart').getContext('2d');
+        const lineChart = new Chart(lineCtx, {
+            type: 'line',
+            data: {
+                labels: {{ line_labels|safe }},
+                datasets: [{
+                    label: 'Monthly Expenses',
+                    data: {{ line_values|safe }},
+                    borderColor: '#36A2EB',
+                    tension: 0.1
+                }]
+            },
+            options: {
+                scales: {
+                    y: {
+                        beginAtZero: true
+                    }
+                }
+            }
+        });
+    </script>
+</body>
+</html>
+
+3.home.html
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Expense Tracker</title>
+</head>
+<body>
+    <h1>Welcome to Expense Tracker</h1>
+    <p><a href="{{ url_for('login') }}">Login</a> or <a href="{{ url_for('register') }}">Register</a></p>
+</body>
+</html>
+
+4.settings.html
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Settings</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body class="container mt-4">
+    <nav class="navbar navbar-expand-lg navbar-light bg-light mb-4">
+        <div class="container-fluid">
+            <a class="navbar-brand" href="/">Expense Tracker</a>
+            <div class="navbar-nav">
+                <a class="nav-link" href="/dashboard">Dashboard</a>
+                <a class="nav-link" href="/expenses">Expenses</a>
+                <a class="nav-link" href="/categories">Categories</a>
+                <a class="nav-link" href="/reports">Reports</a>
+                <a class="nav-link active" href="/settings">Settings</a>
+                <a class="nav-link" href="/logout">Logout</a>
+            </div>
+        </div>
+    </nav>
+
+    <h1 class="mb-4">Settings</h1>
+
+    <div class="row">
+        <div class="col-md-6">
+            <div class="card mb-4">
+                <div class="card-header">
+                    <h5>Change Password</h5>
+                </div>
+                <div class="card-body">
+                    <form method="post">
+                        <div class="mb-3">
+                            <label for="current_password" class="form-label">Current Password</label>
+                            <input type="password" class="form-control" id="current_password" name="current_password" required>
+                        </div>
+                        <div class="mb-3">
+                            <label for="new_password" class="form-label">New Password</label>
+                            <input type="password" class="form-control" id="new_password" name="new_password" required>
+                        </div>
+                        <div class="mb-3">
+                            <label for="confirm_password" class="form-label">Confirm New Password</label>
+                            <input type="password" class="form-control" id="confirm_password" name="confirm_password" required>
+                        </div>
+                        <button type="submit" class="btn btn-primary" name="password_change">Change Password</button>
+                    </form>
+                </div>
+            </div>
+        </div>
+
+        <div class="col-md-6">
+            <div class="card mb-4">
+                <div class="card-header">
+                    <h5>Appearance</h5>
+                </div>
+                <div class="card-body">
+                    <form method="post">
+                        <div class="mb-3">
+                            <label for="theme" class="form-label">Theme</label>
+                            <select class="form-select" id="theme" name="theme">
+                                <option value="light">Light</option>
+                                <option value="dark">Dark</option>
+                                <option value="system">System Default</option>
+                            </select>
+                        </div>
+                        <button type="submit" class="btn btn-primary" name="theme_change">Save Preferences</button>
+                    </form>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header bg-danger text-white">
+                    <h5>Danger Zone</h5>
+                </div>
+                <div class="card-body">
+                    <p class="text-danger">Deleting your account will permanently remove all your data.</p>
+                    <button class="btn btn-danger" data-bs-toggle="modal" data-bs-target="#deleteAccountModal">
+                        Delete Account
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Delete Account Modal -->
+    <div class="modal fade" id="deleteAccountModal" tabindex="-1">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">Confirm Account Deletion</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <p>Are you sure you want to delete your account? This action cannot be undone.</p>
+                    <p class="text-danger">All your expenses, categories, and data will be permanently deleted.</p>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <form method="post" style="display:inline;">
+                        <button type="submit" class="btn btn-danger" name="delete_account">Delete Account</button>
+                    </form>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
